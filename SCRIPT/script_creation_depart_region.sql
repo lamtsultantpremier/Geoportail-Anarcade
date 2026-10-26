@@ -1,0 +1,1 @@
+drop table stagging.depart_import;

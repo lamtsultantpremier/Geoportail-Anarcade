@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Environnement virtuel
+venv/
+.venv/
+
+# Variables secrètes
+.env
+
+# Django
+db.sqlite3
+media/
+
+# IDE
+.vscode/
+.idea/
+
+geoportail-anarcade-front-end\node_modules
