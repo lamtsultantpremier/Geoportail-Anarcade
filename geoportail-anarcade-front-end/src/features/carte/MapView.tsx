@@ -10,6 +10,13 @@ import { useUi } from '../../lib/store'
 import type { Filters } from '../filters/useFilters'
 import { useParcelPoints, useParcelPolygons, type Bbox } from './useMapData'
 
+
+import {setWorkerUrl } from 'maplibre-gl';
+import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+
+setWorkerUrl(workerUrl);
+
+
 const MAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
 const MAX_BOUNDS: Bbox = [-12, 1.5, 1, 13.5]
 const CI_BOUNDS: Bbox = [-8.6, 4.3, -2.5, 10.75]
