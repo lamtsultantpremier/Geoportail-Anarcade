@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-
+import { DEFAULT_BASEMAP } from '../features/carte/basemaps'
 interface FlyTarget { lng: number; lat: number; key: number }
 
 interface UiState {
@@ -17,7 +17,7 @@ export const useUi = create<UiState>((set) => ({
   hoveredId: null,
   selectedId: null,
   flyTo: null,
-  layers: { parcels: true, admin: true, protected: true, base: true },
+  layers: { parcels: true, admin: false, regions: true, base: true ,zone:true},
   setHovered: (hoveredId) => set({ hoveredId }),
   setSelected: (selectedId) => set({ selectedId }),
   // `key` change à chaque demande : on peut re-cibler le même point

@@ -46,14 +46,30 @@ export default function FilterSidebar() {
   const set = (patch: Partial<Filters>) => setDraft({ ...draft, ...patch })
 
   const layerList = [
-    { key: 'parcels', label: "Parcelles d'anacarde", sub: 'Données validées' },
-    { key: 'admin', label: 'Limites administratives', sub: 'Régions et départements' },
-    { key: 'protected', label: 'Zones protégées', sub: 'Illustratif (démo)' },
-    { key: 'base', label: 'Fond de carte', sub: 'Schématique' },
+    { key: 'regions', label: 'Regions', sub: 'Regions en Côte d Ivoire' },
+    { key: 'zone', label: "Zones interdites", sub: 'Zone Interdites' },
+    // { key: 'base', label: 'Forêts classées', sub: 'Zones Protégées' },
+    // { key: 'admin', label: 'Limites administratives', sub: 'Régions et départements' },
   ]
 
   return (
     <aside className="h-fit rounded-2xl border border-line bg-white p-5">
+         <div className="mt-6 border-t border-line pt-5">
+        <div className="mb-3 flex justify-between text-sm">
+          <span className="font-medium">Couches SIG</span>
+          <span className="text-xs text-muted">{layerList.length} couches</span>
+        </div>
+        {layerList.map((l) => (
+          <label key={l.key} className="mb-3 flex cursor-pointer items-start gap-3">
+            <input type="checkbox" className="mt-1"
+              checked={layers[l.key]} onChange={() => toggleLayer(l.key)} />
+            <span className="text-sm leading-tight">
+              {l.label}
+              <span className="block text-xs text-muted">{l.sub}</span>
+            </span>
+          </label>
+        ))}
+      </div>
       <div className="flex items-center justify-between">
         <span className="flex items-center gap-2 font-medium">
           <SlidersHorizontal size={16} /> Filtres
@@ -113,22 +129,7 @@ export default function FilterSidebar() {
         <Filter size={16} /> Appliquer les filtres
       </button>
 
-      <div className="mt-6 border-t border-line pt-5">
-        <div className="mb-3 flex justify-between text-sm">
-          <span className="font-medium">Couches SIG</span>
-          <span className="text-xs text-muted">{layerList.length} couches</span>
-        </div>
-        {layerList.map((l) => (
-          <label key={l.key} className="mb-3 flex cursor-pointer items-start gap-3">
-            <input type="checkbox" className="mt-1 accent-[#1f6b45]"
-              checked={layers[l.key]} onChange={() => toggleLayer(l.key)} />
-            <span className="text-sm leading-tight">
-              {l.label}
-              <span className="block text-xs text-muted">{l.sub}</span>
-            </span>
-          </label>
-        ))}
-      </div>
+   
     </aside>
   )
 }

@@ -8,7 +8,7 @@ import { Loader2, MapPin } from 'lucide-react'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useUi } from '../../lib/store'
 import type { Filters } from '../filters/useFilters'
-import { useParcelPoints, useParcelPolygons, type Bbox } from './useMapData'
+import { useParcelPoints, useParcelPolygons,useRegions ,type Bbox } from './useMapData'
 
 
 import {setWorkerUrl } from 'maplibre-gl';
@@ -39,9 +39,11 @@ export default function MapView({ filters, isFiltered }: Props) {
   const [cursor, setCursor] = useState<[number, number] | null>(null)
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null)
   const [overCluster, setOverCluster] = useState(false)
+  const  [hoveredRegion, setHoveredRegion] = useState<string|null>(null)
   const [view, setView] = useState<{ bbox: Bbox; zoom: number } | null>(null)
 
   // ── Données ───────────────────────────────────────────────
+  const regions = useRegions()
   const points = useParcelPoints(filters)
   const showPolygons = (view?.zoom ?? 0) >= POLYGON_ZOOM
   const polygons = useParcelPolygons(view?.bbox ?? null, filters, showPolygons)
@@ -94,32 +96,66 @@ useEffect(() => {
 }, [flyTo])
 
   // ── Interactions ──────────────────────────────────────────
-  const onMove = (e: MapLayerMouseEvent) => {
-    setCursor([e.lngLat.lat, e.lngLat.lng])
-    const f = e.features?.[0]
 
-    if (!f) {
-      setHovered(null); setHoverInfo(null); setOverCluster(false)
-      return
-    }
-    if (f.properties?.point_count !== undefined) {
-      setHovered(null); setHoverInfo(null); setOverCluster(true)
-      return
-    }
+ const onMove = (e: MapLayerMouseEvent) => {
+  // Détecter séparément la région sous le curseur
+  const regionFeature = layers.regions
+    ? e.target.queryRenderedFeatures(e.point, {
+        layers: ['regions-fill'],
+      })[0]
+    : undefined
 
+  setHoveredRegion(
+    regionFeature
+      ? String(regionFeature.properties?.lib_reg ?? '')
+      : null
+  )
+
+  setCursor([e.lngLat.lat, e.lngLat.lng])
+
+  // Ne récupérer que les éléments interactifs des parcelles
+  const f = e.features?.[0]
+
+  if (!f) {
+    setHovered(null)
+    setHoverInfo(null)
     setOverCluster(false)
-    const id = String(f.properties?.id)
-    setHovered(id)
-    setHoverInfo((prev) => {
-      if (prev?.id === id) return prev            // évite que le popup suive la souris
-      const [lng, lat] = f.geometry.type === 'Point'
-        ? (f.geometry.coordinates as [number, number])
-        : [e.lngLat.lng, e.lngLat.lat]
-      return { id, code: String(f.properties?.code ?? id), lng, lat }
-    })
+    return
   }
 
-  const onLeave = () => { setHovered(null); setHoverInfo(null); setOverCluster(false) }
+  // Survol d'un regroupement de parcelles
+  if (f.properties?.point_count !== undefined) {
+    setHovered(null)
+    setHoverInfo(null)
+    setOverCluster(true)
+    return
+  }
+
+  // Survol d'une parcelle
+  setOverCluster(false)
+
+  const id = String(f.properties?.id)
+
+  setHovered(id)
+
+  setHoverInfo((prev) => {
+    if (prev?.id === id) return prev
+
+    const [lng, lat] =
+      f.geometry.type === 'Point'
+        ? (f.geometry.coordinates as [number, number])
+        : [e.lngLat.lng, e.lngLat.lat]
+
+    return {
+      id,
+      code: String(f.properties?.code ?? id),
+      lng,
+      lat,
+    }
+  })
+}
+
+  const onLeave = () => { setHovered(null); setHoverInfo(null); setOverCluster(false) , setHoveredRegion(null)}
 
   const onClick = async (e: MapLayerMouseEvent) => {
     const map = ref.current
@@ -172,6 +208,92 @@ useEffect(() => {
       >
         <NavigationControl position="top-right" showCompass />
         <ScaleControl position="bottom-right" unit="metric" />
+        {/* Régions de Côte d'Ivoire */}
+        <Source
+              id="regions"
+              type="geojson"
+              data={regions.data ?? EMPTY_FC}>
+        <Layer
+              id="regions-fill"
+              type="fill"
+              layout={{
+                visibility:layers.regions ? 'visible' : 'none'
+              }}
+              paint={{
+                    'fill-color': '#795548',
+                    'fill-opacity': 0.55,
+                  }}/>
+
+        <Layer
+              id="regions-line"
+              type="line"
+              layout={{
+                visibility:layers.regions ? 'visible' : 'none'
+              }}
+              paint={{
+                    'line-color': '#FFFFFF',
+                    'line-width': 2.5,
+                    'line-opacity': 1,
+                  }}/>
+                {/* Nom de chaque région */}
+            <Layer
+                id="regions-label"
+                type="symbol"
+                filter={[
+                      '==',
+                      ['get', 'lib_reg'],
+                      hoveredRegion ?? '__aucune_region__',]}
+                layout={{
+                      'text-field': ['get', 'lib_reg'],
+                      'text-font': ['Noto Sans Regular'],
+                      'text-size': 13,
+                      'text-anchor': 'center',
+                      'text-offset': [0, -0.8],
+                      'text-allow-overlap': true,
+                visibility: layers.regions ? 'visible' : 'none',
+                }}
+                paint={{
+                      'text-color': '#3E2723',
+                      'text-halo-color': '#FFFFFF',
+                      'text-halo-width': 2,
+                    }}
+
+                    
+                    
+                  />
+        
+      </Source>
+        {/* Zones interdites */}
+      <Source
+        id="zones-interdites"
+        type="geojson"
+        data="/data/zones-interdites.geojson">
+          {/* Remplissage des zones */}
+      <Layer
+          id="zones-interdites-fill"
+          type="fill"
+          layout={{
+            visibility: layers.zone ? 'visible' : 'none',
+          }}
+        paint={{
+            'fill-color': '#67cb57',
+            'fill-opacity': 1
+        }}
+        />
+
+        {/* Contours des zones */}
+        <Layer
+            id="zones-interdites-line"
+            type="line"
+            layout={{
+            visibility: layers.zone ? 'visible' : 'none',
+            }}
+            paint={{
+              'line-color': '#FF000099',
+              'line-width': 1.5,
+              'line-opacity': 0.5,}}
+          />
+      </Source>
 
         {/* Contour de la Côte d'Ivoire */}
         <Source id="ci" type="geojson" data="/data/ci.geojson">
@@ -276,7 +398,7 @@ useEffect(() => {
         )}
       </div>
 
-      {(points.isFetching || polygons.isFetching) && (
+      {(regions.isFetching||points.isFetching || polygons.isFetching) && (
         <div className="pointer-events-none absolute left-1/2 top-4 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-white px-3 py-2 text-xs shadow">
           <Loader2 size={14} className="animate-spin text-brand-600" /> Chargement…
         </div>
@@ -293,12 +415,19 @@ useEffect(() => {
           Zone très dense : zoomez pour afficher toutes les parcelles.
         </div>
       )}
+      {regions.isError && (
+        <div className="absolute left-1/2 top-16 -translate-x-1/2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700 shadow">
+                Impossible de charger les régions. Vérifie l'API Django.
+          </div>
+       )}
 
       <div className="absolute bottom-10 left-4 rounded-xl bg-white p-3 text-xs shadow">
         <div className="mb-2 text-[10px] tracking-widest text-muted">LÉGENDE</div>
         {[
           ['#1f6b45', "Parcelles d'anacarde"],
-          ['#3f8f5d', 'Groupe de parcelles'],
+          // ['#3f8f5d', 'Groupe de parcelles'],
+          ['#795548', 'Regions'],
+          ['#67cb57', 'Forêts classées'],
           ['#305CDE', 'Limite nationale'],
         ].map(([c, l]) => (
           <div key={l} className="mb-1 flex items-center gap-2">

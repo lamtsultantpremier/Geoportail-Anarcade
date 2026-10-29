@@ -35,3 +35,14 @@ export interface Surveyor {
   organization: string     // ex. "ANADER", "Coopérative", "Équipe SIG"
   zone: string             // zone d'intervention
 }
+
+export interface   RegionProperties
+{
+  id_reg:number,
+  lib_reg:string
+}
+
+export type RegionsResponse = GeoJSON.FeatureCollection<
+  GeoJSON.Geometry,
+  RegionProperties
+>
