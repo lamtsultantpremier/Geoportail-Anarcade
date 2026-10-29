@@ -1,6 +1,14 @@
 
 import json
 
+import re
+from django.db.models import OuterRef, Subquery
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
 from django.db import connection
 from django.db.models import Avg
 import csv
@@ -355,6 +363,12 @@ def lire_decimal(valeur):
 
 
 
+
+def liste_valeurs(params, cle):
+    """'3,7,12' → ['3', '7', '12'] (seuls les entiers sont gardés)."""
+    brut = params.get(cle, "") or ""
+    return [v.strip() for v in brut.split(",") if v.strip().isdigit()]
+
 def parcelles_filtrees(params):
     """Renvoie les parcelles correspondant aux filtres géographiques reçus."""
     queryset = ParcelleCorrecte.objects.select_related(
@@ -369,9 +383,9 @@ def parcelles_filtrees(params):
     )
 
     for parametre, chemin in CHEMINS_FILTRES.items():
-        valeur = params.get(parametre)
-        if valeur:
-            queryset = queryset.filter(**{chemin: valeur})
+        valeurs = liste_valeurs(params, parametre)
+        if valeurs:
+            queryset = queryset.filter(**{f"{chemin}__in": valeurs})
 
     queryset = avec_superficie(queryset)
     sup_min = lire_decimal(params.get("superficie_min"))
@@ -891,15 +905,18 @@ def exploitants_avec_parcelles():
     )
 
 
-@api_view(["GET"])
-def liste_exploitants_api(request):
-    """
-    Liste paginée des exploitants (avec parcelles validées).
-    Paramètres : q (recherche), page, page_size.
-    """
+CHEMINS_FILTRES_EXPLOITANT = {
+    "region_id": "id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg__id_reg",
+    "departement_id": "id_men__id_quar__id_loc__id_s_pref__id_dept__id_dept",
+    "sous_prefecture_id": "id_men__id_quar__id_loc__id_s_pref__id_s_pref",
+    "localite_id": "id_men__id_quar__id_loc__id_loc",
+}
+
+def exploitants_filtres(params):
+    """Exploitants (avec parcelles validées) selon la recherche `q` et les filtres géographiques."""
     queryset = exploitants_avec_parcelles()
 
-    terme = request.query_params.get("q", "").strip()
+    terme = params.get("q", "").strip()
     for mot in terme.split()[:5]:
         queryset = queryset.filter(
             Q(nom_expl__icontains=mot)
@@ -908,6 +925,20 @@ def liste_exploitants_api(request):
             | Q(contacts__icontains=mot)
             | Q(**{f"{CHEMIN_QUARTIER}__icontains": mot})
         )
+
+    for parametre, chemin in CHEMINS_FILTRES_EXPLOITANT.items():
+        valeurs = liste_valeurs(params, parametre)
+        if valeurs:
+            queryset = queryset.filter(**{f"{chemin}__in": valeurs})
+    return queryset
+
+@api_view(["GET"])
+def liste_exploitants_api(request):
+    """
+    Liste paginée des exploitants (avec parcelles validées).
+    Paramètres : q (recherche), page, page_size.
+    """
+    queryset = exploitants_filtres(request.query_params)
 
     queryset = queryset.select_related("id_men__id_quar").order_by(
         "nom_expl", "pren_expl", "id_expl"
@@ -1679,3 +1710,204 @@ def liste_regions_geojson(request):
         "type": "FeatureCollection",
         "features": features,
     })
+
+
+
+
+# ── Export complet des exploitants ─────────────────────────────────
+
+M = "id_expl__id_men"   # ménage, depuis ParcelleCorrecte
+
+# (en-tête, champ). Partie « exploitant » : répétée sur chaque ligne.
+COLONNES_EXPLOITANT = [
+    ("Code exploitant", "id_expl__code_expl"),
+    ("Nom", "id_expl__nom_expl"),
+    ("Prénom(s)", "id_expl__pren_expl"),
+    ("Date de naissance", "id_expl__date_nais"),
+    ("Lieu de naissance", "id_expl__lieu_nais"),
+    ("Pays de naissance", "id_expl__pays_nais"),
+    ("Nationalité", "id_expl__nationalite"),
+    ("Situation matrimoniale", "id_expl__situa_mat"),
+    ("Profession", "id_expl__profession"),
+    ("Niveau d'instruction", "id_expl__id_niv__lib_niv"),
+    ("Téléphone", "id_expl__contacts"),
+    ("Nom (personne déclarée)", "id_expl__nom_declare"),
+    ("Prénom(s) (personne déclarée)", "id_expl__pren_declare"),
+    ("Contact (personne déclarée)", "id_expl__cont_declare"),
+    ("Code ménage", f"{M}__code_men"),
+    ("Nom du chef de ménage", f"{M}__nom_chef"),
+    ("Prénom(s) du chef de ménage", f"{M}__pren_chef"),
+    ("Contact du chef de ménage", f"{M}__cont_chef"),
+    ("Nombre d'enfants", f"{M}__nb_enfant"),
+    ("Nombre de femmes", f"{M}__nb_femme"),
+    ("Région", f"{CHEMIN_SP}__id_dept__id_reg__lib_reg"),
+    ("Département", f"{CHEMIN_SP}__id_dept__lib_dept"),
+    ("Sous-préfecture", f"{CHEMIN_SP}__lib_s_pref"),
+    ("Localité", f"{CHEMIN_LOC}__lib_loc"),
+    ("Quartier", f"{M}__id_quar__lib_quar"),
+]
+
+COLONNES_PARCELLE = [
+    ("Code parcelle", "code_parc"),
+    ("Superficie (ha)", "superficie_ha"),
+    ("Année de mise en place", "annee_mise_place"),
+    ("Mode de faire-valoir", "id_mode__lib_mode"),
+    ("Date de géoréférencement", "date_geor"),
+    ("Enquêteur", "id_enqt__nom_pren_enqt"),
+    ("Code enquêteur", "id_enqt__code_enqt"),
+    ("Contact enquêteur", "id_enqt__cont_enqt"),
+    ("Date de l'enquête", "date_enq"),
+    ("N° de questionnaire", "num_quest"),
+]
+
+CHAMPS_EXPORT = [c for _, c in COLONNES_EXPLOITANT + COLONNES_PARCELLE]
+N_EXPL = len(COLONNES_EXPLOITANT)
+IDX_SUPERFICIE = N_EXPL + 1
+
+
+def _valeur_csv(v):
+    if v is None:
+        return ""
+    if isinstance(v, date):
+        return v.strftime("%d/%m/%Y")
+    if isinstance(v, (Decimal, float)):
+        return str(v).replace(".", ",")
+    return _cellule(v)
+
+
+def _valeur_xlsx(v):
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", _cellule(v))
+    return v
+
+
+def _entete_xlsx(ws, titres):
+    cellules = []
+    for titre in titres:
+        c = WriteOnlyCell(ws, value=titre)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="1F6B45")
+        c.alignment = Alignment(vertical="center", wrap_text=True)
+        cellules.append(c)
+    ws.append(cellules)
+    for i in range(1, len(titres) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 20
+    ws.freeze_panes = "A2"
+
+
+def _libelles_filtres(params):
+    """Filtres appliqués, en clair, pour la feuille « Informations »."""
+    noms = {
+        "region_id": ("region", "Région"),
+        "departement_id": ("departement", "Département"),
+        "sous_prefecture_id": ("sous_prefecture", "Sous-préfecture"),
+        "localite_id": ("localite", "Localité"),
+    }
+    lignes = []
+    for cle, (niveau, libelle) in noms.items():
+        valeurs = liste_valeurs(params, cle)
+        if not valeurs:
+            continue
+        modele, champ_id, champ_nom = MODELES_GEO[niveau]
+        noms_zones = list(
+            modele.objects.filter(**{f"{champ_id}__in": valeurs})
+            .order_by(champ_nom).values_list(champ_nom, flat=True)
+        )
+        lignes.append((libelle, ", ".join(noms_zones) or ", ".join(valeurs)))
+    if params.get("q", "").strip():
+        lignes.append(("Recherche", params["q"].strip()))
+    return lignes or [("Filtres", "Aucun (tous les exploitants)")]
+
+
+@require_GET
+def export_exploitants(request):
+    """
+    Export complet des exploitants filtrés : ?fmt=xlsx (défaut) | csv
+    Accepte les mêmes paramètres que la liste : q, region_id, departement_id,
+    sous_prefecture_id, localite_id.
+    """
+    fmt = request.GET.get("fmt", "xlsx").lower()
+    if fmt not in ("csv", "xlsx"):
+        return JsonResponse({"detail": "fmt attendu : xlsx ou csv"}, status=400)
+
+    ids = exploitants_filtres(request.GET).order_by().values("id_expl")
+    parcelles = (
+        avec_superficie(ParcelleCorrecte.objects.filter(id_expl__in=ids))
+        .annotate(
+            date_geor=Subquery(
+                Georeferencement.objects.filter(id_parc=OuterRef("id_parc"))
+                .order_by("-date_geor").values("date_geor")[:1]
+            ),
+            date_enq=Subquery(
+                Enquete.objects.filter(id_expl=OuterRef("id_expl"))
+                .order_by("-date_enq").values("date_enq")[:1]
+            ),
+            num_quest=Subquery(
+                Enquete.objects.filter(id_expl=OuterRef("id_expl"))
+                .order_by("-date_enq").values("num_questionnaire")[:1]
+            ),
+        )
+        .order_by("id_expl__nom_expl", "id_expl__pren_expl", "id_expl__id_expl", "code_parc")
+        .values_list(*CHAMPS_EXPORT)
+    )
+    jour = date.today().isoformat()
+
+    # ── CSV : tableau unique, une ligne par parcelle ──
+    if fmt == "csv":
+        def flux():
+            ecrivain = csv.writer(_Echo(), delimiter=";")
+            yield "\ufeff"
+            yield ecrivain.writerow([t for t, _ in COLONNES_EXPLOITANT + COLONNES_PARCELLE])
+            for ligne in parcelles.iterator(chunk_size=2000):
+                yield ecrivain.writerow([_valeur_csv(v) for v in ligne])
+
+        reponse = StreamingHttpResponse(flux(), content_type="text/csv; charset=utf-8")
+        reponse["Content-Disposition"] = f'attachment; filename="exploitants_{jour}.csv"'
+        return reponse
+
+    # ── Excel : Informations / Exploitants / Parcelles ──
+    lignes = list(parcelles.iterator(chunk_size=2000))
+
+    exploitants = {}   # code exploitant → [valeurs, nb parcelles, superficie totale]
+    for r in lignes:
+        e = exploitants.setdefault(r[0], [list(r[:N_EXPL]), 0, 0.0])
+        e[1] += 1
+        e[2] += float(r[IDX_SUPERFICIE] or 0)
+
+    wb = Workbook(write_only=True)
+
+    info = wb.create_sheet("Informations")
+    info.column_dimensions["A"].width = 26
+    info.column_dimensions["B"].width = 50
+    info.append(["Export des exploitants · Géoportail Anacarde"])
+    info.append(["Date d'export", date.today().strftime("%d/%m/%Y")])
+    for libelle, valeur in _libelles_filtres(request.GET):
+        info.append([libelle, valeur])
+    info.append(["Exploitants", len(exploitants)])
+    info.append(["Parcelles", len(lignes)])
+    info.append(["Superficie totale (ha)", round(sum(e[2] for e in exploitants.values()), 2)])
+
+    ws_e = wb.create_sheet("Exploitants")
+    titres_e = [t for t, _ in COLONNES_EXPLOITANT] + ["Nombre de parcelles", "Superficie totale (ha)"]
+    _entete_xlsx(ws_e, titres_e)
+    for valeurs, nb, sup in exploitants.values():
+        ws_e.append([_valeur_xlsx(v) for v in valeurs] + [nb, round(sup, 2)])
+    ws_e.auto_filter.ref = f"A1:{get_column_letter(len(titres_e))}{len(exploitants) + 1}"
+
+    ws_p = wb.create_sheet("Parcelles")
+    titres_p = ["Code exploitant", "Nom", "Prénom(s)"] + [t for t, _ in COLONNES_PARCELLE]
+    _entete_xlsx(ws_p, titres_p)
+    for r in lignes:
+        ws_p.append([_valeur_xlsx(v) for v in (*r[:3], *r[N_EXPL:])])
+    ws_p.auto_filter.ref = f"A1:{get_column_letter(len(titres_p))}{len(lignes) + 1}"
+
+    tampon = io.BytesIO()
+    wb.save(tampon)
+    reponse = HttpResponse(
+        tampon.getvalue(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    reponse["Content-Disposition"] = f'attachment; filename="exploitants_{jour}.xlsx"'
+    return reponse

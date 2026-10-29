@@ -22,7 +22,8 @@ from parcelles.views import (
     donnees_recapitulatif,
     export_geometrie_parcelle,
     # ------------------------- Version 2 de l'application
-    liste_regions_geojson
+    liste_regions_geojson,
+    export_exploitants
 )
 """
 URL configuration for config project.
@@ -91,7 +92,8 @@ urlpatterns = [
     path("parcelles/<int:id_parc>/export/", export_geometrie_parcelle, name="export-geometrie-parcelle"),
 
     # -------------- Version 2 de la plateforme ------------------------------------
-    path('regions/geojson/',liste_regions_geojson,name="liste_region")
+    path('regions/geojson/',liste_regions_geojson,name="liste_region"),
+    path("exploitants/export/", export_exploitants, name="export-exploitants"),
 
 
 
