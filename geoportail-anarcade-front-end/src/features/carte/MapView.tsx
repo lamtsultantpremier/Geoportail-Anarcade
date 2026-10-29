@@ -10,6 +10,11 @@ import { useUi } from '../../lib/store'
 import type { Filters } from '../filters/useFilters'
 import { useParcelPoints, useParcelPolygons,useRegions ,type Bbox } from './useMapData'
 
+// import type { StyleSpecification } from 'maplibre-gl'
+import BasemapSwitcher from './BasemapSwitcher'
+import { BASEMAPS } from './basemaps'
+import { BASE_STYLE } from './baseStyle'
+
 
 import {setWorkerUrl } from 'maplibre-gl';
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
@@ -17,7 +22,7 @@ import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 setWorkerUrl(workerUrl);
 
 
-const MAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
+// const MAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
 const MAX_BOUNDS: Bbox = [-12, 1.5, 1, 13.5]
 const CI_BOUNDS: Bbox = [-8.6, 4.3, -2.5, 10.75]
 
@@ -33,9 +38,35 @@ interface Props { filters: Filters; isFiltered: boolean }
 interface HoverInfo { id: string; code: string; lng: number; lat: number }
 
 // ── Composant MapView ───────────────────────────────────────────────
+// const BASE_STYLE: StyleSpecification = {
+//   version: 8,
+//   glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+//   sources: Object.fromEntries(
+//     BASEMAPS.map((b) => [
+//       `bm-${b.id}`,
+//       {
+//         type: 'raster' as const,
+//         tiles: b.tiles,
+//         tileSize: b.tileSize,
+//         maxzoom: b.maxzoom,
+//         attribution: b.attribution,
+//       },
+//     ]),
+//   ),
+//   layers: [
+//     { id: 'bg', type: 'background', paint: { 'background-color': '#e7ebdb' } },
+//     ...BASEMAPS.map((b) => ({
+//       id: `bm-${b.id}`,
+//       type: 'raster' as const,
+//       source: `bm-${b.id}`,
+//       layout: { visibility: 'none' as const },
+//     })),
+//   ],
+// }
+
 export default function MapView({ filters, isFiltered }: Props) {
   const ref = useRef<MapRef>(null)
-  const { hoveredId, selectedId, flyTo,setHovered, setSelected, layers } = useUi()
+  const { hoveredId, selectedId, flyTo,setHovered, setSelected, layers,basemap } = useUi()
   const [cursor, setCursor] = useState<[number, number] | null>(null)
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null)
   const [overCluster, setOverCluster] = useState(false)
@@ -94,6 +125,20 @@ useEffect(() => {
   if (!flyTo) return
   ref.current?.flyTo({ center: [flyTo.lng, flyTo.lat], zoom: 16, duration: 1200 })
 }, [flyTo])
+
+// Affiche uniquement le fond choisi (sans recharger le style)
+useEffect(() => {
+  const map = ref.current?.getMap()
+  if (!map) return
+  const apply = () =>
+    BASEMAPS.forEach((b) => {
+      if (map.getLayer(`bm-${b.id}`)) {
+        map.setLayoutProperty(`bm-${b.id}`, 'visibility', b.id === basemap ? 'visible' : 'none')
+      }
+    })
+  if (map.isStyleLoaded()) apply()
+  else map.once('load', apply)
+}, [basemap])
 
   // ── Interactions ──────────────────────────────────────────
 
@@ -194,13 +239,16 @@ useEffect(() => {
     <div className="relative size-full">
       <Map
         ref={ref}
-        mapStyle={MAP_STYLE}
+        mapStyle={BASE_STYLE}
         initialViewState={{ bounds: CI_BOUNDS, fitBoundsOptions: { padding: 20 } }}
         minZoom={4}
         maxBounds={MAX_BOUNDS}
         interactiveLayerIds={['clusters', 'parcels-dots', 'parcels-fill']}
         cursor={pointer ? 'pointer' : 'grab'}
-        onLoad={syncView}
+        onLoad={() => {syncView()
+                    const map = ref.current?.getMap()
+                    BASEMAPS.forEach((b) =>
+                    map?.setLayoutProperty(`bm-${b.id}`, 'visibility', b.id === basemap ? 'visible' : 'none'),)}}
         onMoveEnd={syncView}
         onMouseMove={onMove}
         onMouseLeave={onLeave}
@@ -221,7 +269,7 @@ useEffect(() => {
               }}
               paint={{
                     'fill-color': '#795548',
-                    'fill-opacity': 0.55,
+                    'fill-opacity': 0.15,
                   }}/>
 
         <Layer
@@ -231,9 +279,9 @@ useEffect(() => {
                 visibility:layers.regions ? 'visible' : 'none'
               }}
               paint={{
-                    'line-color': '#FFFFFF',
+                    'line-color': '#FF7F00',
                     'line-width': 2.5,
-                    'line-opacity': 1,
+                    'line-opacity': 0.5,
                   }}/>
                 {/* Nom de chaque région */}
             <Layer
@@ -297,7 +345,7 @@ useEffect(() => {
 
         {/* Contour de la Côte d'Ivoire */}
         <Source id="ci" type="geojson" data="/data/ci.geojson">
-          <Layer id="ci-fill" type="fill" paint={{ 'fill-color': '#000000', 'fill-opacity': 0.08 }} />
+          <Layer id="ci-fill" type="fill" paint={{ 'fill-color': '#000000', 'fill-opacity': 0.0}} />
           <Layer id="ci-line" type="line" paint={{ 'line-color': '#305CDE', 'line-width': 3, 'line-opacity': 0.9 }} />
         </Source>
 
@@ -387,6 +435,7 @@ useEffect(() => {
           </Popup>
         )}
       </Map>
+      <BasemapSwitcher />
 
       {/* Surcouches */}
       <div className="pointer-events-none absolute left-4 top-4 flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-xs font-medium shadow">
