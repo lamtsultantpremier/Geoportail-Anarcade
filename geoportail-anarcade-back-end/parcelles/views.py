@@ -1647,3 +1647,35 @@ def export_geometrie_parcelle(request, id_parc):
 
     reponse["Content-Disposition"] = f'attachment; filename="{nom}"'
     return reponse
+
+
+# ------------------------- REGIONS ------------------------------------------------
+@api_view(["GET"])
+def liste_regions_geojson(request):
+    regions = (
+        Region.objects
+        .filter(geom_reg__isnull=False)
+        .annotate(geojson=AsGeoJSON("geom_reg"))
+        .values("id_reg", "lib_reg", "geojson")
+        .order_by("lib_reg")
+    )
+
+    features = []
+
+    for region in regions:
+        if not region["geojson"]:
+            continue
+
+        features.append({
+            "type": "Feature",
+            "geometry": json.loads(region["geojson"]),
+            "properties": {
+                "id_reg": region["id_reg"],
+                "lib_reg": region["lib_reg"],
+            },
+        })
+
+    return Response({
+        "type": "FeatureCollection",
+        "features": features,
+    })
