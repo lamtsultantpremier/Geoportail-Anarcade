@@ -1,11 +1,12 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Database, FlaskConical, Map as MapIcon, Sprout, Upload, Users } from 'lucide-react'
+import { Database, FlaskConical, Map as MapIcon, Sprout, Upload, Users,ChartSpline  } from 'lucide-react'
 import clsx from 'clsx'
 
 const nav = [
   { to: '/', label: 'Carte', icon: MapIcon },
   { to: '/exploitants', label: 'Exploitants', icon: Users },
-  { to: '/data', label: 'Données', icon: Database },
+  { to: '/data', label: 'Statiques', icon: ChartSpline },
+  { to: '/data-sent', label: 'Données validées', icon: Database },
 ]
 
 export default function Layout() {
