@@ -12,3 +12,22 @@ export async function apiGet<T>(path: string, params: Params = {}, signal?: Abor
   return res.json() as Promise<T>
 }
 
+export async function apiSend<T>(
+  method: 'POST' | 'DELETE', path: string, body?: unknown,
+): Promise<T> {
+  const headers: Record<string, string> = {}
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  const token = import.meta.env.VITE_IMPORT_TOKEN
+  if (token) headers['X-Import-Token'] = token
+
+  const res = await fetch(`${BASE}${path}`, {
+    method, headers, body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    let message = `Erreur ${res.status}`
+    try { message = (await res.json()).detail ?? message } catch { /* corps vide */ }
+    throw new Error(message)
+  }
+  return (res.status === 204 ? undefined : await res.json()) as T
+}
+

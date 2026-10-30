@@ -2,6 +2,9 @@ import { NavLink, Outlet } from 'react-router-dom'
 import { Database, FlaskConical, Map as MapIcon, Sprout, Upload, Users,ChartSpline  } from 'lucide-react'
 import clsx from 'clsx'
 
+import { useImports } from '../features/imports/importStore'
+import ImportModal from '../features/imports/ImportModal'
+
 const nav = [
   { to: '/', label: 'Carte', icon: MapIcon },
   { to: '/exploitants', label: 'Exploitants', icon: Users },
@@ -10,6 +13,7 @@ const nav = [
 ]
 
 export default function Layout() {
+  const openImport = useImports((s) => s.openImport)
   return (
     <div className="flex min-h-screen flex-col">
       <header className="flex items-center gap-8 border-b border-line bg-white px-6 py-3">
@@ -39,10 +43,10 @@ export default function Layout() {
           ))}
         </nav>
 
-        <div className="ml-auto flex items-center gap-4">
-          <button className="flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-sm font-medium hover:bg-canvas">
-            <Upload size={16} /> Importer des données validées
-          </button>
+          <div className="ml-auto flex items-center gap-4">
+              <button onClick={openImport} className="flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-sm font-medium hover:bg-canvas">
+                  <Upload size={16} /> Importer des données validées
+              </button>
           <div className="flex items-center gap-2">
             <div className="grid size-10 place-items-center rounded-full bg-banner text-sm font-semibold text-banner-ink">AK</div>
             <div className="text-xs leading-tight">
@@ -64,6 +68,7 @@ export default function Layout() {
       <main className="flex-1 px-6 py-6">
         <Outlet />
       </main>
+      <ImportModal />
     </div>
   )
 }
