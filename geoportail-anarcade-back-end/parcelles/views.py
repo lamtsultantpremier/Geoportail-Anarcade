@@ -979,7 +979,7 @@ def fiche_exploitant(request, id_expl):
 
     parcelles = list(
         avec_superficie(ParcelleCorrecte.objects.filter(id_expl=exploitant.id_expl))
-        .select_related("id_mode")
+        .select_related("id_mode", "id_enqt")
         .annotate(
             lng=CoordX("geom_parc"),
             lat=CoordY("geom_parc"),
@@ -987,6 +987,17 @@ def fiche_exploitant(request, id_expl):
         )
         .order_by("code_parc")
     )
+
+    ids_parcelles = [p.id_parc for p in parcelles]
+
+    dates_georeferencement = {}
+    for g in (
+        Georeferencement.objects
+        .filter(id_parc__in=ids_parcelles)
+        .order_by("id_parc", "-date_geor")
+        .values("id_parc", "date_geor")
+    ):
+        dates_georeferencement.setdefault(g["id_parc"], g["date_geor"])
 
     menage = exploitant.id_men
     quartier = _suivre(menage, "id_quar")
@@ -1015,10 +1026,17 @@ def fiche_exploitant(request, id_expl):
     liste = []
     for p in parcelles:
         lieu = lieux.get(p.id_parc, {})
+
+        enqueteur = _suivre(p, "id_enqt")
+
         liste.append({
             "id": p.id_parc,
             "code": p.code_parc,
-            "superficie_ha": float(p.superficie_ha) if p.superficie_ha is not None else None,
+            "superficie_ha": (
+                float(p.superficie_ha)
+                if p.superficie_ha is not None
+                else None
+            ),
             "annee_mise_place": p.annee_mise_place,
             "mode_faire_valoir": _suivre(p, "id_mode", "lib_mode"),
             "region": lieu.get(cle_reg),
@@ -1027,6 +1045,16 @@ def fiche_exploitant(request, id_expl):
             "lng": p.lng,
             "lat": p.lat,
             "geometrie": json.loads(p.geojson) if p.geojson else None,
+
+            "enqueteur": {
+                "code": _suivre(enqueteur, "code_enqt"),
+                "nom": _suivre(enqueteur, "nom_pren_enqt"),
+                "contact": _suivre(enqueteur, "cont_enqt"),
+            } if enqueteur else None,
+
+            "date_georeferencement": _iso(
+                dates_georeferencement.get(p.id_parc)
+            ),
         })
 
     superficie_totale = sum(p["superficie_ha"] or 0 for p in liste)
@@ -1057,6 +1085,13 @@ def fiche_exploitant(request, id_expl):
             "sous_prefecture": _suivre(sous_pref, "lib_s_pref"),
             "departement": _suivre(departement, "lib_dept"),
             "region": _suivre(region, "lib_reg"),
+        },
+        "menage": {
+            "nom_chef": _suivre(menage, "nom_chef"),
+            "prenom_chef": _suivre(menage, "pren_chef"),
+            "contact_chef": _suivre(menage, "cont_chef"),
+            "nb_enfants": _suivre(menage, "nb_enfant"),
+            "nb_femmes": _suivre(menage, "nb_femme"),
         },
         "indicateurs": {
             "nb_parcelles": len(liste),
