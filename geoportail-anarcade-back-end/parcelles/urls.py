@@ -23,7 +23,15 @@ from parcelles.views import (
     export_geometrie_parcelle,
     # ------------------------- Version 2 de l'application
     liste_regions_geojson,
-    export_exploitants
+    export_exploitants,
+    imports_collection,
+    import_detail,
+    import_geojson,
+    import_publier,
+    import_annuler
+
+
+    
 )
 """
 URL configuration for config project.
@@ -95,6 +103,12 @@ urlpatterns = [
     path('regions/geojson/',liste_regions_geojson,name="liste_region"),
     path("exploitants/export/", export_exploitants, name="export-exploitants"),
 
+    #--------------- Version Import de parcelle---------------------------------------
+    path("imports/", imports_collection, name="imports"),
+    path("imports/<int:id_lot>/", import_detail, name="import-detail"),
+    path("imports/<int:id_lot>/geojson/", import_geojson, name="import-geojson"),
+    path("imports/<int:id_lot>/publier/", import_publier, name="import-publier"),
+    path("imports/<int:id_lot>/annuler/", import_annuler, name="import-annuler"),
 
 
     # path('exploitants/<int:id>/',views.detail_exploitant,name="detail_exploitant")

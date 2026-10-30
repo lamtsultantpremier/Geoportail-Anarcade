@@ -1,4 +1,5 @@
 from decouple import config
+import os
 """
 Django settings for config project.
 
@@ -16,6 +17,11 @@ from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Les imports envoient des GeoJSON volumineux (limite par défaut : 2,5 Mo)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024
+
+# Protection provisoire des écritures d'import (voir l'avertissement plus bas)
+IMPORT_TOKEN = os.environ.get("IMPORT_TOKEN", "")
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/

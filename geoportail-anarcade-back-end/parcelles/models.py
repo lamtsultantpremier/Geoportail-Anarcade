@@ -259,3 +259,35 @@ class ZoneDenombrement(models.Model):
     class Meta:
         managed = False
         db_table = 'zone_denombrement'
+
+class ImportLot(models.Model):
+    nom_fichier = models.CharField(max_length=255)
+    format = models.CharField(max_length=20)
+    statut = models.CharField(max_length=10, default="brouillon")  # brouillon | publie | annule
+    cree_le = models.DateTimeField(auto_now_add=True)
+    publie_le = models.DateTimeField(null=True, blank=True)
+    nb_total = models.IntegerField(default=0)
+    nb_valides = models.IntegerField(default=0)
+    nb_avertissements = models.IntegerField(default=0)
+    nb_erreurs = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = "import_lot"
+        ordering = ["-cree_le"]
+
+
+class ImportParcelle(models.Model):
+    lot = models.ForeignKey(ImportLot, on_delete=models.CASCADE, related_name="parcelles")
+    rang = models.PositiveIntegerField()
+    code = models.CharField(max_length=100, null=True, blank=True)
+    geojson = models.TextField()                       # géométrie corrigée (MultiPolygon)
+    proprietes = models.JSONField(default=dict)
+    statut = models.CharField(max_length=14)           # valide | avertissement | erreur
+    messages = models.JSONField(default=list)
+    id_expl = models.IntegerField(null=True, blank=True)
+    superficie_ha = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    id_parc_publie = models.IntegerField(null=True, blank=True)
+
+    class Meta:
+        db_table = "import_parcelle"
+        ordering = ["rang"]

@@ -59,6 +59,10 @@ from xml.sax.saxutils import escape as xml_escape
 import shapefile  # pyshp
 
 
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+from .models import ImportLot, ImportParcelle
+
 class AsGeoJSON(Func):
     function = "ST_AsGeoJSON"
     output_field = TextField()
@@ -1946,3 +1950,272 @@ def export_exploitants(request):
     )
     reponse["Content-Disposition"] = f'attachment; filename="exploitants_{jour}.xlsx"'
     return reponse
+
+
+# ── Import de parcelles validées ───────────────────────────────────
+
+HA_MIN, HA_MAX = 0.01, 500
+CHEVAUCHEMENT_MAX = 0.5
+CODE_MAX = 50
+LIMITE_LOT = 20000
+
+
+def _jeton_ok(request):
+    """Protection provisoire : si IMPORT_TOKEN est défini, l'en-tête X-Import-Token doit correspondre."""
+    attendu = getattr(settings, "IMPORT_TOKEN", "")
+    return not attendu or request.headers.get("X-Import-Token") == attendu
+
+
+def _code_exploitant(code, props):
+    for cle in ("code_exploitant", "code_expl"):
+        v = props.get(cle)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return code[:-2] if code and len(code) > 2 else None
+
+
+def _annee(props):
+    for cle in ("annee_mise_place", "annee"):
+        try:
+            n = int(str(props.get(cle)).strip())
+        except (TypeError, ValueError):
+            continue
+        if ANNEE_MIN_VALIDE <= n <= date.today().year:
+            return n
+    return None
+
+
+def _analyser_geometrie(geojson_txt):
+    """(valide_à_l_origine, géométrie corrigée en GeoJSON, superficie en ha). Lève une exception si illisible."""
+    with transaction.atomic(), connection.cursor() as cur:   # savepoint : une erreur SQL ne casse pas le lot
+        cur.execute(
+            """
+            WITH t AS (SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) AS g),
+                 v AS (SELECT ST_IsValid(g) AS ok,
+                              ST_Multi(ST_CollectionExtract(ST_MakeValid(g), 3)) AS m FROM t)
+            SELECT ok, ST_AsGeoJSON(m), ST_Area(m::geography) / 10000.0 FROM v
+            """,
+            [geojson_txt],
+        )
+        ok, corrige, ha = cur.fetchone()
+    return ok, corrige, Decimal(str(ha or 0))
+
+
+def _chevauche(geojson_txt):
+    """Nombre de parcelles existantes recouvertes à plus de 50 % (0 si le calcul échoue)."""
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM parcelle_correcte p,
+                     (SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) AS g) t
+                WHERE p.geom_parc && t.g AND ST_Intersects(p.geom_parc, t.g)
+                  AND ST_Area(ST_Intersection(p.geom_parc, t.g)::geography)
+                      > %s * ST_Area(t.g::geography)
+                """,
+                [geojson_txt, CHEVAUCHEMENT_MAX],
+            )
+            return cur.fetchone()[0]
+    except Exception:
+        return 0
+
+
+def _valider_lot(lot, items):
+    prepares = []
+    for i, item in enumerate(items):
+        props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+        code = str(item.get("code") or "").strip() or None
+        prepares.append((i, code, props, item.get("geometry")))
+
+    codes = [c for _, c, _, _ in prepares if c]
+    vus = Counter(codes)
+    en_base = set(ParcelleCorrecte.objects.filter(code_parc__in=codes).values_list("code_parc", flat=True))
+    codes_expl = {_code_exploitant(c, p) for _, c, p, _ in prepares} - {None}
+    expl = dict(Exploitant.objects.filter(code_expl__in=codes_expl).values_list("code_expl", "id_expl"))
+
+    lignes, compte = [], Counter()
+    for i, code, props, geom in prepares:
+        msgs = []
+
+        def erreur(t): msgs.append({"niveau": "erreur", "texte": t})
+        def avert(t): msgs.append({"niveau": "avertissement", "texte": t})
+
+        if not code:
+            erreur("Code de parcelle manquant.")
+        elif len(code) > CODE_MAX:
+            erreur(f"Code trop long (plus de {CODE_MAX} caractères).")
+        elif vus[code] > 1:
+            erreur("Code en double dans ce fichier.")
+        elif code in en_base:
+            erreur("Ce code existe déjà dans la base.")
+
+        id_expl = expl.get(_code_exploitant(code, props)) if code else None
+        if code and id_expl is None:
+            erreur("Exploitant introuvable pour ce code.")
+
+        geojson, ha = "", None
+        if not isinstance(geom, dict) or geom.get("type") not in ("Polygon", "MultiPolygon"):
+            erreur("Géométrie absente ou qui n'est pas un polygone.")
+        else:
+            try:
+                ok, corrige, ha = _analyser_geometrie(json.dumps(geom))
+                if not corrige or ha <= 0:
+                    erreur("Géométrie vide ou impossible à réparer.")
+                else:
+                    geojson = corrige
+                    if not ok:
+                        avert("Géométrie invalide à l'origine : réparée automatiquement.")
+                    if not (HA_MIN <= ha <= HA_MAX):
+                        avert(f"Superficie inhabituelle ({ha:.2f} ha).")
+                    if _chevauche(corrige):
+                        avert("Chevauche une parcelle déjà enregistrée.")
+            except Exception:
+                erreur("Géométrie illisible.")
+
+        statut = ("erreur" if any(m["niveau"] == "erreur" for m in msgs)
+                  else "avertissement" if msgs else "valide")
+        compte[statut] += 1
+        lignes.append(ImportParcelle(
+            lot=lot, rang=i, code=code, geojson=geojson or json.dumps(geom or {}),
+            proprietes=props, statut=statut, messages=msgs, id_expl=id_expl,
+            superficie_ha=ha if geojson else None,
+        ))
+
+    ImportParcelle.objects.bulk_create(lignes, batch_size=500)
+    lot.nb_total = len(lignes)
+    lot.nb_valides = compte["valide"]
+    lot.nb_avertissements = compte["avertissement"]
+    lot.nb_erreurs = compte["erreur"]
+    lot.save()
+
+
+def _resume_lot(lot):
+    return {
+        "id": lot.id, "fichier": lot.nom_fichier, "format": lot.format, "statut": lot.statut,
+        "cree_le": lot.cree_le.isoformat(),
+        "publie_le": lot.publie_le.isoformat() if lot.publie_le else None,
+        "total": lot.nb_total, "valides": lot.nb_valides,
+        "avertissements": lot.nb_avertissements, "erreurs": lot.nb_erreurs,
+    }
+
+
+@api_view(["GET", "POST"])
+def imports_collection(request):
+    if request.method == "GET":
+        return Response([_resume_lot(l) for l in ImportLot.objects.all()[:50]])
+
+    if not _jeton_ok(request):
+        return Response({"detail": "Import non autorisé."}, status=403)
+    items = request.data.get("items")
+    if not isinstance(items, list) or not items:
+        return Response({"detail": "Aucune parcelle à importer."}, status=400)
+    if len(items) > LIMITE_LOT:
+        return Response({"detail": f"Maximum {LIMITE_LOT} parcelles par fichier."}, status=400)
+
+    with transaction.atomic():
+        lot = ImportLot.objects.create(
+            nom_fichier=str(request.data.get("fichier", "import"))[:255],
+            format=str(request.data.get("format", ""))[:20],
+        )
+        _valider_lot(lot, items)
+    return Response(_resume_lot(lot), status=201)
+
+
+@api_view(["GET", "DELETE"])
+def import_detail(request, id_lot):
+    lot = get_object_or_404(ImportLot, pk=id_lot)
+    if request.method == "DELETE":
+        if not _jeton_ok(request):
+            return Response({"detail": "Non autorisé."}, status=403)
+        if lot.statut == "publie":
+            return Response({"detail": "Annulez d'abord la publication."}, status=409)
+        lot.delete()
+        return Response(status=204)
+    return Response(_resume_lot(lot))
+
+
+@api_view(["GET"])
+def import_geojson(request, id_lot):
+    lot = get_object_or_404(ImportLot, pk=id_lot)
+    features = []
+    for p in lot.parcelles.all():
+        try:
+            geometrie = json.loads(p.geojson)
+        except ValueError:
+            continue
+        if geometrie.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+        features.append({
+            "type": "Feature", "geometry": geometrie,
+            "properties": {
+                "rang": p.rang, "code": p.code, "statut": p.statut, "messages": p.messages,
+                "superficie_ha": float(p.superficie_ha) if p.superficie_ha is not None else None,
+                "proprietes": p.proprietes,
+            },
+        })
+    return Response({"type": "FeatureCollection", "features": features})
+
+
+@api_view(["POST"])
+def import_publier(request, id_lot):
+    if not _jeton_ok(request):
+        return Response({"detail": "Non autorisé."}, status=403)
+    lot = get_object_or_404(ImportLot, pk=id_lot)
+    if lot.statut != "brouillon":
+        return Response({"detail": "Ce lot n'est pas un brouillon."}, status=409)
+
+    publiees = 0
+    with transaction.atomic(), connection.cursor() as cur:
+        for p in lot.parcelles.exclude(statut="erreur"):
+            cur.execute("SELECT 1 FROM parcelle_correcte WHERE code_parc = %s", [p.code])
+            if cur.fetchone():   # un autre lot a pu publier ce code entre-temps
+                p.statut = "erreur"
+                p.messages = [*p.messages, {"niveau": "erreur", "texte": "Ce code existe déjà dans la base."}]
+                p.save()
+                continue
+            sup = f"{p.superficie_ha:.6f}".replace(".", ",") if p.superficie_ha is not None else None
+            cur.execute(
+                """
+                INSERT INTO parcelle_correcte
+                    (code_parc, annee_mise_place, geom_parc, superficie_tracee, id_expl)
+                VALUES (%s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s, %s)
+                RETURNING id_parc
+                """,
+                [p.code, _annee(p.proprietes), p.geojson, sup, p.id_expl],
+            )
+            p.id_parc_publie = cur.fetchone()[0]
+            p.save()
+            publiees += 1
+
+        if publiees == 0:
+            return Response({"detail": "Aucune parcelle valide à publier."}, status=409)
+        lot.statut = "publie"
+        lot.publie_le = timezone.now()
+        lot.nb_valides = lot.parcelles.filter(statut="valide", id_parc_publie__isnull=False).count()
+        lot.nb_avertissements = lot.parcelles.filter(statut="avertissement", id_parc_publie__isnull=False).count()
+        lot.nb_erreurs = lot.parcelles.filter(statut="erreur").count()
+        lot.save()
+    return Response({**_resume_lot(lot), "publiees": publiees})
+
+
+@api_view(["POST"])
+def import_annuler(request, id_lot):
+    if not _jeton_ok(request):
+        return Response({"detail": "Non autorisé."}, status=403)
+    lot = get_object_or_404(ImportLot, pk=id_lot)
+    if lot.statut != "publie":
+        return Response({"detail": "Ce lot n'est pas publié."}, status=409)
+
+    ids = list(lot.parcelles.filter(id_parc_publie__isnull=False).values_list("id_parc_publie", flat=True))
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute("DELETE FROM parcelle_correcte WHERE id_parc = ANY(%s)", [ids])
+            lot.parcelles.update(id_parc_publie=None)
+            lot.statut = "annule"
+            lot.save()
+    except IntegrityError:
+        return Response(
+            {"detail": "Des données (géoréférencement, etc.) référencent déjà ces parcelles : annulation impossible."},
+            status=409,
+        )
+    return Response(_resume_lot(lot))
