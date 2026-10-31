@@ -11,7 +11,13 @@ import { useUi } from '../../lib/store'
 import { useImports } from './importStore'
 
 const CI_BOUNDS: Bbox = [-8.6, 4.3, -2.5, 10.75]
-const COLOR: any = ['case', ['==', ['get', '_status'], 'erreur'], '#ef4444', ['get', '_color']]
+const COLOR: any = [
+  'match', ['get', '_status'],
+  'erreur', '#ef4444',
+  'doublon', '#f97316',
+  'conservee', '#9ca3af',
+  ['get', '_color'],
+]
 
 export default function ImportedMap() {
   const ref = useRef<MapRef>(null)
@@ -118,6 +124,14 @@ export default function ImportedMap() {
             <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: '#ef4444' }} />
             Parcelle en erreur
           </div>
+          <div className="flex items-center gap-2">
+                <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: '#f97316' }} />
+                    Existe déjà (à confirmer)
+        </div>
+        <div className="flex items-center gap-2">
+            <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: '#9ca3af' }} />
+                Ancienne parcelle conservée
+        </div>
         </div>
       )}
     </div>

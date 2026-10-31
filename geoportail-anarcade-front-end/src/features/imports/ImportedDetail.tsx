@@ -16,6 +16,14 @@ const attributes = (f: PolyFeature) =>
 
 const show = (v: unknown) => (typeof v === 'object' ? JSON.stringify(v) : String(v))
 
+const VERDICT: Record<string, string> = {
+    valide: 'publiable', avertissement: 'publiable avec réserves',
+    doublon: 'existe déjà : remplacement à confirmer à la publication',
+    erreur: 'ne sera pas publiée', publiee: 'insérée dans la base',
+    remplacee: 'a remplacé la parcelle existante (même identifiant)',
+    conservee: "non publiée : l'ancienne parcelle a été conservée",
+}
+
 function exportFeature(f: PolyFeature) {
   const props = Object.fromEntries(Object.entries(f.properties).filter(([k]) => !k.startsWith('_')))
   const blob = new Blob(
@@ -144,7 +152,7 @@ export default function ImportedDetail({ feature, file, onClose }: {
             </ul>
             )}
             <p className="mt-2 text-[12px] text-muted">
-                Résultat : {statut === 'erreur' ? 'ne sera pas publiée' : statut === 'avertissement' ? 'publiable avec réserves' : 'publiable'}.
+               <p className="mt-2 text-[12px] text-muted">Résultat : {VERDICT[statut] ?? statut}.</p>
             </p>
         </section>
         )}

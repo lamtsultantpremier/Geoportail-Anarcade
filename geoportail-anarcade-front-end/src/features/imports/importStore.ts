@@ -10,6 +10,7 @@ interface LotSummary {
   id: number; fichier: string; format: string; statut: LotStatus
   cree_le: string; publie_le: string | null
   total: number; valides: number; avertissements: number; erreurs: number
+  doublons: number
 }
 
 export interface ImportedFile {
@@ -25,6 +26,7 @@ export interface ImportedFile {
   color: string
   addedAt: string
   publishedAt: string | null
+  doublons: number
 }
 
 export interface ServerMessage { niveau: 'erreur' | 'avertissement'; texte: string }
@@ -33,7 +35,8 @@ interface ServerFeature {
   type: 'Feature'
   geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon
   properties: {
-    rang: number; code: string | null; statut: 'valide' | 'avertissement' | 'erreur'
+    rang: number; code: string | null; 
+    statut: 'valide' | 'avertissement' | 'doublon' | 'erreur' | 'remplacee' | 'conservee' | 'publiee'
     messages: ServerMessage[]; superficie_ha: number | null; proprietes: Record<string, unknown>
   }
 }
@@ -50,7 +53,7 @@ interface ImportState {
   closeImport: () => void
   select: (uid: string | null) => void
   refresh: () => Promise<void>
-  publish: (lotId: number) => Promise<void>
+  publish: (lotId: number, remplacer?: number[]) => Promise<void>
   cancel: (lotId: number) => Promise<void>
   remove: (lotId: number) => Promise<void>
 }
@@ -82,7 +85,7 @@ export const useImports = create<ImportState>((set, get) => {
         const files: ImportedFile[] = lots.map((l) => ({
           id: String(l.id), lotId: l.id, name: l.fichier, format: l.format, statut: l.statut,
           total: l.total, valides: l.valides, avertissements: l.avertissements, erreurs: l.erreurs,
-          color: PALETTE[l.id % PALETTE.length], addedAt: l.cree_le, publishedAt: l.publie_le,
+          color: PALETTE[l.id % PALETTE.length], addedAt: l.cree_le, publishedAt: l.publie_le,doublons: l.doublons ?? 0,
         }))
 
         const features: PolyFeature[] = []
@@ -118,7 +121,7 @@ export const useImports = create<ImportState>((set, get) => {
       }
     },
 
-    publish: (id) => act(id, () => apiSend('POST', `/imports/${id}/publier/`)),
+    publish: (id, remplacer = []) => act(id, () => apiSend('POST', `/imports/${id}/publier/`, { remplacer })),
     cancel: (id) => act(id, () => apiSend('POST', `/imports/${id}/annuler/`)),
     remove: (id) => act(id, () => apiSend('DELETE', `/imports/${id}/`)),
   }

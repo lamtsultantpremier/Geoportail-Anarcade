@@ -5,6 +5,10 @@ import { useImports, type ImportedFile } from './importStore'
 import ImportedDetail from './ImportedDetail'
 import ImportedMap from './ImportedMap'
 
+import { useState } from 'react'
+import ReplaceDialog from './ReplaceDialog'
+import { fetchPreview, type Preview } from './useImportPreview'
+
 const nf = new Intl.NumberFormat('fr-FR')
 
 const BADGE: Record<ImportedFile['statut'], { label: string; cls: string }> = {
@@ -14,6 +18,7 @@ const BADGE: Record<ImportedFile['statut'], { label: string; cls: string }> = {
 }
 
 export default function DataSentPage() {
+  const [pending, setPending] = useState<{ file: ImportedFile; preview: Preview } | null>(null)
   const qc = useQueryClient()
   const {
     files, features, selectedUid, loading, error, busyLot,
@@ -30,11 +35,27 @@ export default function DataSentPage() {
   const refreshPlatform = () => qc.invalidateQueries()
 
   const onPublish = async (f: ImportedFile) => {
-    const n = f.valides + f.avertissements
-    if (!window.confirm(`Publier ${nf.format(n)} parcelle(s) de « ${f.name} » dans la base ?\n${f.erreurs} en erreur seront ignorées.`)) return
-    await publish(f.lotId)
+  try {
+    const preview = await fetchPreview(f.lotId)
+    if (preview.doublons.length > 0) {
+      setPending({ file: f, preview })          // demander confirmation parcelle par parcelle
+      return
+    }
+    const n = preview.a_inserer
+    if (!window.confirm(`Publier ${nf.format(n)} nouvelle(s) parcelle(s) de « ${f.name} » ?`)) return
+    await publish(f.lotId, [])
     refreshPlatform()
+  } catch (e) {
+    window.alert(e instanceof Error ? e.message : 'Publication impossible.')
   }
+}
+
+const onConfirmReplace = async (rangs: number[]) => {
+  if (!pending) return
+  await publish(pending.file.lotId, rangs)
+  setPending(null)
+  refreshPlatform()
+}
   const onCancel = async (f: ImportedFile) => {
     if (!window.confirm(`Retirer de la base les parcelles publiées depuis « ${f.name} » ?`)) return
     await cancel(f.lotId)
@@ -100,7 +121,7 @@ export default function DataSentPage() {
             <ul className="max-h-[calc(100vh-300px)] space-y-2.5 overflow-y-auto">
               {files.map((f) => {
                 const busy = busyLot === f.lotId
-                const publishable = f.statut === 'brouillon' && f.valides + f.avertissements > 0
+                const publishable = f.statut === 'brouillon' && f.valides + f.avertissements + f.doublons > 0
                 const b = BADGE[f.statut]
                 return (
                   <li key={f.id} className="rounded-xl border border-line p-3">
@@ -128,7 +149,11 @@ export default function DataSentPage() {
                             <div className="flex items-center gap-1.5 text-red-700">
                               <AlertTriangle size={12} /> {nf.format(f.erreurs)} en erreur (ignorées)
                             </div>
-                          )}
+                          )}{f.doublons > 0 && (
+                                <div className="flex items-center gap-1.5 text-orange-700">
+                                    <AlertTriangle size={12} /> {nf.format(f.doublons)} existe{f.doublons > 1 ? 'nt' : ''} déjà (à confirmer)
+                                </div>
+                            )}
                         </div>
                       </div>
                     </div>
@@ -143,7 +168,8 @@ export default function DataSentPage() {
                       {f.statut === 'publie' && (
                         <button onClick={() => onCancel(f)} disabled={busy}
                           className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold hover:bg-canvas disabled:opacity-60">
-                          {busy ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />} Annuler la publication
+                          {busy ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />} 
+                                Annuler la publication
                         </button>
                       )}
                       {f.statut !== 'publie' && (
@@ -172,6 +198,15 @@ export default function DataSentPage() {
             />
           )}
         </div>
+      )}
+        {pending && (
+        <ReplaceDialog
+          fileName={pending.file.name}
+          preview={pending.preview}
+          busy={busyLot === pending.file.lotId}
+          onCancel={() => setPending(null)}
+          onConfirm={onConfirmReplace}
+        />
       )}
     </div>
   )
