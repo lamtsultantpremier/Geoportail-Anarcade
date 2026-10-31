@@ -2001,7 +2001,24 @@ def _analyser_geometrie(geojson_txt):
     return ok, corrige, Decimal(str(ha or 0))
 
 
-def _chevauche(geojson_txt):
+def _chevauche(geojson_txt, exclure_code=None):
+    """Nombre de parcelles existantes recouvertes à plus de 50 % (0 si le calcul échoue)."""
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM parcelle_correcte p,
+                     (SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) AS g) t
+                WHERE p.geom_parc && t.g AND ST_Intersects(p.geom_parc, t.g)
+                  AND (%s IS NULL OR p.code_parc <> %s)
+                  AND ST_Area(ST_Intersection(p.geom_parc, t.g)::geography)
+                      > %s * ST_Area(t.g::geography)
+                """,
+                [geojson_txt, exclure_code, exclure_code, CHEVAUCHEMENT_MAX],
+            )
+            return cur.fetchone()[0]
+    except Exception:
+        return 0
     """Nombre de parcelles existantes recouvertes à plus de 50 % (0 si le calcul échoue)."""
     try:
         with transaction.atomic(), connection.cursor() as cur:
@@ -2040,6 +2057,7 @@ def _valider_lot(lot, items):
         def erreur(t): msgs.append({"niveau": "erreur", "texte": t})
         def avert(t): msgs.append({"niveau": "avertissement", "texte": t})
 
+        doublon = False
         if not code:
             erreur("Code de parcelle manquant.")
         elif len(code) > CODE_MAX:
@@ -2047,7 +2065,8 @@ def _valider_lot(lot, items):
         elif vus[code] > 1:
             erreur("Code en double dans ce fichier.")
         elif code in en_base:
-            erreur("Ce code existe déjà dans la base.")
+            doublon = True
+            avert("Une parcelle portant ce code existe déjà : remplacement à confirmer à la publication.")
 
         id_expl = expl.get(_code_exploitant(code, props)) if code else None
         if code and id_expl is None:
@@ -2067,14 +2086,16 @@ def _valider_lot(lot, items):
                         avert("Géométrie invalide à l'origine : réparée automatiquement.")
                     if not (HA_MIN <= ha <= HA_MAX):
                         avert(f"Superficie inhabituelle ({ha:.2f} ha).")
-                    if _chevauche(corrige):
+                    if _chevauche(corrige, exclure_code=code if doublon else None):
                         avert("Chevauche une parcelle déjà enregistrée.")
             except Exception:
                 erreur("Géométrie illisible.")
 
         statut = ("erreur" if any(m["niveau"] == "erreur" for m in msgs)
+                  else "doublon" if doublon
                   else "avertissement" if msgs else "valide")
         compte[statut] += 1
+        
         lignes.append(ImportParcelle(
             lot=lot, rang=i, code=code, geojson=geojson or json.dumps(geom or {}),
             proprietes=props, statut=statut, messages=msgs, id_expl=id_expl,
@@ -2086,6 +2107,7 @@ def _valider_lot(lot, items):
     lot.nb_valides = compte["valide"]
     lot.nb_avertissements = compte["avertissement"]
     lot.nb_erreurs = compte["erreur"]
+    lot.nb_doublons = compte["doublon"]
     lot.save()
 
 
@@ -2096,6 +2118,7 @@ def _resume_lot(lot):
         "publie_le": lot.publie_le.isoformat() if lot.publie_le else None,
         "total": lot.nb_total, "valides": lot.nb_valides,
         "avertissements": lot.nb_avertissements, "erreurs": lot.nb_erreurs,
+        "doublons": lot.nb_doublons,
     }
 
 
@@ -2155,7 +2178,6 @@ def import_geojson(request, id_lot):
         })
     return Response({"type": "FeatureCollection", "features": features})
 
-
 @api_view(["POST"])
 def import_publier(request, id_lot):
     if not _jeton_ok(request):
@@ -2164,39 +2186,84 @@ def import_publier(request, id_lot):
     if lot.statut != "brouillon":
         return Response({"detail": "Ce lot n'est pas un brouillon."}, status=409)
 
-    publiees = 0
-    with transaction.atomic(), connection.cursor() as cur:
-        for p in lot.parcelles.exclude(statut="erreur"):
-            cur.execute("SELECT 1 FROM parcelle_correcte WHERE code_parc = %s", [p.code])
-            if cur.fetchone():   # un autre lot a pu publier ce code entre-temps
-                p.statut = "erreur"
-                p.messages = [*p.messages, {"niveau": "erreur", "texte": "Ce code existe déjà dans la base."}]
-                p.save()
-                continue
+    remplacer = request.data.get("remplacer", [])
+    if not isinstance(remplacer, list) or not all(isinstance(r, int) for r in remplacer):
+        return Response({"detail": "Liste « remplacer » invalide."}, status=400)
+    confirmes = set(remplacer)
+
+    bilan = Counter()
+    with transaction.atomic(), connection.cursor() as cur:      # tout ou rien
+        for p in lot.parcelles.exclude(statut="erreur").order_by("rang"):
+            cur.execute(
+                "SELECT id_parc, code_parc, annee_mise_place, superficie_tracee, id_expl, "
+                "ST_AsGeoJSON(geom_parc) FROM parcelle_correcte WHERE code_parc = %s FOR UPDATE",
+                [p.code],
+            )
+            existante = cur.fetchone()
             sup = f"{p.superficie_ha:.6f}".replace(".", ",") if p.superficie_ha is not None else None
+            annee = _annee(p.proprietes)
+
+            # Cas 1 : nouvelle parcelle → insertion
+            if existante is None:
+                cur.execute(
+                    """
+                    INSERT INTO parcelle_correcte
+                        (code_parc, annee_mise_place, geom_parc, superficie_tracee, id_expl)
+                    VALUES (%s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s, %s)
+                    RETURNING id_parc
+                    """,
+                    [p.code, annee, p.geojson, sup, p.id_expl],
+                )
+                p.id_parc_publie = cur.fetchone()[0]
+                p.statut = "publiee"
+                p.save()
+                bilan["inserees"] += 1
+                continue
+
+            id_existant = existante[0]
+
+            # Cas 2b : doublon non confirmé → on garde l'ancienne, on rejette la nouvelle
+            if p.rang not in confirmes:
+                p.statut = "conservee"
+                p.id_parc_remplace = id_existant
+                p.messages = [*p.messages, {"niveau": "avertissement",
+                              "texte": "Parcelle existante conservée : la nouvelle n'a pas été publiée."}]
+                p.save()
+                bilan["conservees"] += 1
+                continue
+
+            # Cas 2a : doublon confirmé → remplacement, id_parc conservé
+            p.ancienne_version = {
+                "annee_mise_place": existante[2],
+                "superficie_tracee": existante[3],
+                "id_expl": existante[4],
+                "geometrie": existante[5],
+            }
             cur.execute(
                 """
-                INSERT INTO parcelle_correcte
-                    (code_parc, annee_mise_place, geom_parc, superficie_tracee, id_expl)
-                VALUES (%s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s, %s)
-                RETURNING id_parc
+                UPDATE parcelle_correcte
+                   SET annee_mise_place = %s,
+                       geom_parc = ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326),
+                       superficie_tracee = %s,
+                       id_expl = %s
+                 WHERE id_parc = %s
                 """,
-                [p.code, _annee(p.proprietes), p.geojson, sup, p.id_expl],
+                [annee, p.geojson, sup, p.id_expl, id_existant],
             )
-            p.id_parc_publie = cur.fetchone()[0]
+            p.id_parc_publie = id_existant
+            p.id_parc_remplace = id_existant
+            p.statut = "remplacee"
             p.save()
-            publiees += 1
+            bilan["remplacees"] += 1
 
-        if publiees == 0:
-            return Response({"detail": "Aucune parcelle valide à publier."}, status=409)
+        if bilan["inserees"] + bilan["remplacees"] == 0:
+            transaction.set_rollback(True)
+            return Response({"detail": "Rien à publier : aucune insertion ni remplacement."}, status=409)
+
         lot.statut = "publie"
         lot.publie_le = timezone.now()
-        lot.nb_valides = lot.parcelles.filter(statut="valide", id_parc_publie__isnull=False).count()
-        lot.nb_avertissements = lot.parcelles.filter(statut="avertissement", id_parc_publie__isnull=False).count()
-        lot.nb_erreurs = lot.parcelles.filter(statut="erreur").count()
         lot.save()
-    return Response({**_resume_lot(lot), "publiees": publiees})
-
+    return Response({**_resume_lot(lot), **bilan})
 
 @api_view(["POST"])
 def import_annuler(request, id_lot):
@@ -2206,11 +2273,30 @@ def import_annuler(request, id_lot):
     if lot.statut != "publie":
         return Response({"detail": "Ce lot n'est pas publié."}, status=409)
 
-    ids = list(lot.parcelles.filter(id_parc_publie__isnull=False).values_list("id_parc_publie", flat=True))
+    inserees = list(lot.parcelles.filter(statut="publiee").values_list("id_parc_publie", flat=True))
+    remplacees = list(lot.parcelles.filter(statut="remplacee"))
     try:
         with transaction.atomic(), connection.cursor() as cur:
-            cur.execute("DELETE FROM parcelle_correcte WHERE id_parc = ANY(%s)", [ids])
-            lot.parcelles.update(id_parc_publie=None)
+            for p in remplacees:
+                v = p.ancienne_version or {}
+                cur.execute(
+                    """
+                    UPDATE parcelle_correcte
+                       SET annee_mise_place = %s,
+                           geom_parc = ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326),
+                           superficie_tracee = %s,
+                           id_expl = %s
+                     WHERE id_parc = %s
+                    """,
+                    [v.get("annee_mise_place"), v.get("geometrie"),
+                     v.get("superficie_tracee"), v.get("id_expl"), p.id_parc_remplace],
+                )
+                p.statut, p.id_parc_publie = "doublon", None
+                p.save()
+            if inserees:
+                cur.execute("DELETE FROM parcelle_correcte WHERE id_parc = ANY(%s)", [inserees])
+            lot.parcelles.filter(statut="publiee").update(statut="valide", id_parc_publie=None)
+            lot.parcelles.filter(statut="conservee").update(statut="doublon", id_parc_remplace=None)
             lot.statut = "annule"
             lot.save()
     except IntegrityError:
@@ -2219,3 +2305,41 @@ def import_annuler(request, id_lot):
             status=409,
         )
     return Response(_resume_lot(lot))
+
+@api_view(["GET"])
+def import_apercu(request, id_lot):
+    """Doublons du lot, avec la parcelle existante à côté de la nouvelle (pour confirmation)."""
+    lot = get_object_or_404(ImportLot, pk=id_lot)
+    if lot.statut != "brouillon":
+        return Response({"detail": "Ce lot n'est pas un brouillon."}, status=409)
+
+    doublons = list(lot.parcelles.filter(statut="doublon"))
+    existants = {
+        p["code_parc"]: p
+        for p in avec_superficie(ParcelleCorrecte.objects.filter(code_parc__in=[d.code for d in doublons]))
+        .values("id_parc", "code_parc", "annee_mise_place", "superficie_ha", "id_expl__code_expl")
+    }
+    return Response({
+        "a_inserer": lot.parcelles.filter(statut__in=["valide", "avertissement"]).count(),
+        "erreurs": lot.parcelles.filter(statut="erreur").count(),
+        "doublons": [
+            {
+                "rang": d.rang,
+                "code": d.code,
+                "nouvelle": {
+                    "superficie_ha": float(d.superficie_ha) if d.superficie_ha is not None else None,
+                    "annee": _annee(d.proprietes),
+                },
+                "existante": (
+                    {
+                        "id": e["id_parc"],
+                        "superficie_ha": float(e["superficie_ha"]) if e["superficie_ha"] is not None else None,
+                        "annee": e["annee_mise_place"],
+                        "code_exploitant": e["id_expl__code_expl"],
+                    }
+                    if (e := existants.get(d.code)) else None
+                ),
+            }
+            for d in doublons
+        ],
+    })

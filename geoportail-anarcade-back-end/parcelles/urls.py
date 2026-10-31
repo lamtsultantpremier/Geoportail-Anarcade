@@ -28,7 +28,8 @@ from parcelles.views import (
     import_detail,
     import_geojson,
     import_publier,
-    import_annuler
+    import_annuler,
+    import_apercu
 
 
     
@@ -112,5 +113,5 @@ urlpatterns = [
 
 
     # path('exploitants/<int:id>/',views.detail_exploitant,name="detail_exploitant")
-
+    path("imports/<int:id_lot>/apercu/", import_apercu, name="import-apercu"),
 ]

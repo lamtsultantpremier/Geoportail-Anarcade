@@ -270,7 +270,7 @@ class ImportLot(models.Model):
     nb_valides = models.IntegerField(default=0)
     nb_avertissements = models.IntegerField(default=0)
     nb_erreurs = models.IntegerField(default=0)
-
+    nb_doublons = models.IntegerField(default=0)
     class Meta:
         db_table = "import_lot"
         ordering = ["-cree_le"]
@@ -287,7 +287,9 @@ class ImportParcelle(models.Model):
     id_expl = models.IntegerField(null=True, blank=True)
     superficie_ha = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
     id_parc_publie = models.IntegerField(null=True, blank=True)
-
+    # A été ajouter
+    id_parc_remplace = models.IntegerField(null=True, blank=True)   # id_parc existant remplacé
+    ancienne_version = models.JSONField(null=True, blank=True)      # sauvegarde avant remplacement
     class Meta:
         db_table = "import_parcelle"
         ordering = ["rang"]
