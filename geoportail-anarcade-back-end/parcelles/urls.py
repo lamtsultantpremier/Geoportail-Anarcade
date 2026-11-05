@@ -29,7 +29,23 @@ from parcelles.views import (
     import_geojson,
     import_publier,
     import_annuler,
-    import_apercu
+    import_apercu,
+    liste_denombrements,
+    stats_denombrements,
+    filtres_denombrements,
+    export_denombrements,
+    options_geo_denombrements,
+    options_geo_menages,
+    stats_menages,
+    liste_menages,
+    export_menages,
+    sig_arbre,
+    export_sig,
+    
+
+
+
+
 
 
     
@@ -111,7 +127,23 @@ urlpatterns = [
     path("imports/<int:id_lot>/publier/", import_publier, name="import-publier"),
     path("imports/<int:id_lot>/annuler/", import_annuler, name="import-annuler"),
 
+    # ---------------------- Version denombrement ---------------------
+    path("denombrements/", liste_denombrements, name="liste-denombrements"),
+    path("denombrements/stats/", stats_denombrements, name="stats-denombrements"),
+    path("denombrements/filtres/", filtres_denombrements, name="filtres-denombrements"),
+    path("denombrements/export/", export_denombrements, name="export-denombrements"),
+
+    #---------------------- Version Parcelle -------------------------------
+    path("menages/geo/<str:niveau>/", options_geo_menages, name="menages-geo"),
+    path("menages/stats/", stats_menages, name="stats-menages"),
+    path("menages/", liste_menages, name="liste-menages"),
+    path("menages/export/", export_menages, name="export-menages"),
+
+    #---------------------Version SIG ------------------------------
+    path("sig/arbre/", sig_arbre, name="sig-arbre"),
+    path("sig/export/", export_sig, name="sig-export"),
 
     # path('exploitants/<int:id>/',views.detail_exploitant,name="detail_exploitant")
     path("imports/<int:id_lot>/apercu/", import_apercu, name="import-apercu"),
+    path("denombrements/geo/<str:niveau>/", options_geo_denombrements, name="denombrements-geo"),
 ]

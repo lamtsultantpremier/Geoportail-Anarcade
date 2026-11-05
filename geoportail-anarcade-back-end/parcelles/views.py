@@ -1,13 +1,19 @@
 
 import json
-
+import os
+from django.http import FileResponse
 import re
-from django.db.models import OuterRef, Subquery
+from django.db.models import OuterRef, Subquery, CharField
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+from django.db.models.functions import Coalesce
 
 from django.db import connection
 from django.db.models import Avg
@@ -33,12 +39,20 @@ from .models import (
     Enquete,
     Georeferencement,
     Exploitant,
-    ParcelleIncorrecte
+    ParcelleIncorrecte,
+    Denombrement, 
+    MilieuResidence,
+     Menage, 
+     ZoneDenombrement
 )
 
 from django.db.models import Func, TextField
 from django.shortcuts import get_object_or_404
-from parcelles.pagination import ParcellePagination,ExploitantPagination
+from parcelles.pagination import (
+    ParcellePagination,
+    ExploitantPagination,
+    DenombrementPagination,
+    MenagePagination)
 from decimal import Decimal, InvalidOperation
 from django.db.models import Case, Count, DecimalField, Sum, Value, When
 from django.db.models.functions import Cast, Replace
@@ -2343,3 +2357,852 @@ def import_apercu(request, id_lot):
             for d in doublons
         ],
     })
+
+# ── Dénombrements ──────────────────────────────────────────────────
+
+CHEMIN_REGION_Q = "id_loc__id_s_pref__id_dept__id_reg"
+OUI = r"^(oui|yes|true|1)$"
+
+COLONNES_DENOMB = [
+    ("id", "ID"), ("uuid", "UUID"), ("num_questionnaire", "N° questionnaire"),
+    ("date_enquete", "Date enquête"),
+    ("enqueteur_nom", "Enquêteur (nom et prénom)"), ("enqueteur_contact", "Contact enquêteur"),
+    ("gps", "Coordonnées GPS"), ("district", "District"), ("region", "Région"),
+    ("departement", "Département"), ("sous_prefecture", "Sous-préfecture"),
+    ("secteur", "Secteur administratif"), ("zone", "Zone dénombrement"),
+    ("localite", "Localité"), ("quartier", "Quartier / Campement"),
+    ("milieu", "Milieu résidence"), ("code_menage", "Code ménage"),
+    ("nb_exploitants", "Nb exploitants"), ("a_exploitant", "A exploitant"),
+    ("nom_chef", "Nom chef ménage"), ("prenom_chef", "Prénom chef ménage"),
+    ("contact_chef", "Contact chef ménage"),
+    ("exploitant_present", "Exploitant présent ?"), ("est_representant", "Représentant ?"),
+    ("nom_representant", "Nom représentant"), ("prenom_representant", "Prénom représentant"),
+    ("contact_representant", "Contact représentant"),
+    ("statut", "Statut"), ("source", "Source"), ("cree_le", "Créé le"),
+]
+
+# paramètre → chemin depuis Quartier jusqu'à l'identifiant du niveau
+CHAMPS_GEO_DENOMB = {
+    "region_id": "id_loc__id_s_pref__id_dept__id_reg__id_reg",
+    "departement_id": "id_loc__id_s_pref__id_dept__id_dept",
+    "sous_prefecture_id": "id_loc__id_s_pref__id_s_pref",
+    "localite_id": "id_loc__id_loc",
+}
+
+def denombrements_filtres(params):
+    qs = Denombrement.objects.all()
+
+    for mot in params.get("q", "").strip().split()[:5]:
+        qs = qs.filter(
+            Q(nom_chef_menage__icontains=mot) | Q(prenom_chef_menage__icontains=mot)
+            | Q(num_questionnaire__icontains=mot) | Q(uuid__icontains=mot)
+            | Q(code_men__icontains=mot) | Q(id_men__code_men__icontains=mot)
+            | Q(nom_prenom_enqt__icontains=mot)
+            | Q(id_quar__lib_quar__icontains=mot) | Q(id_men__id_quar__lib_quar__icontains=mot)
+            | Q(id_quar__id_loc__lib_loc__icontains=mot)
+            | Q(id_men__id_quar__id_loc__lib_loc__icontains=mot)
+        )
+
+    # Filtres géographiques multiples (valeurs séparées par des virgules)
+    for param, champ in CHAMPS_GEO_DENOMB.items():
+        valeurs = liste_valeurs(params, param)
+        if valeurs:
+            qs = qs.filter(
+                Q(**{f"id_quar__{champ}__in": valeurs})
+                | Q(**{f"id_men__id_quar__{champ}__in": valeurs})
+            )
+
+    statut = (params.get("statut") or "").strip()
+    if statut:
+        qs = qs.filter(statut=statut)
+
+    milieux = liste_valeurs(params, "milieu_id")
+    if milieux:
+        qs = qs.filter(id_milieu_residence__in=milieux)
+
+    ids = liste_valeurs(params, "ids")[:50000]
+    if ids:
+        qs = qs.filter(id_denomb__in=ids)
+    return qs
+
+
+def avec_details_denomb(qs):
+    """Charge la géographie et ajoute les infos tirées des exploitants du ménage."""
+    geo = "id_loc__id_s_pref__id_dept__id_reg__id_dist"
+    zone = "id_loc__id_zone_denombrement"
+    tous = Exploitant.objects.filter(id_men=OuterRef("id_men")).order_by("id_expl")
+    avec_repr = tous.exclude(nom_representant__isnull=True).exclude(nom_representant="")
+    nb = (Exploitant.objects.filter(id_men=OuterRef("id_men")).order_by()
+          .values("id_men").annotate(n=Count("id_expl")).values("n"))
+
+    return qs.select_related(
+        "id_milieu_residence", "id_men",
+        f"id_quar__{geo}", f"id_quar__{zone}",
+        f"id_men__id_quar__{geo}", f"id_men__id_quar__{zone}",
+    ).annotate(
+        nb_enregistres=Coalesce(Subquery(nb, output_field=IntegerField()), 0),
+        est_repr=Coalesce(
+            Subquery(avec_repr.values("exploitant_est_representant")[:1]),
+            Subquery(tous.values("exploitant_est_representant")[:1]),
+            output_field=CharField(),
+        ),
+        nom_repr=Subquery(avec_repr.values("nom_representant")[:1]),
+        pren_repr=Subquery(avec_repr.values("prenom_representant")[:1]),
+        cont_repr=Subquery(avec_repr.values("contact_representant")[:1]),
+    )
+
+
+def _ligne_denombrement(d):
+    q = d.id_quar or _suivre(d.id_men, "id_quar")
+    loc = _suivre(q, "id_loc")
+    sp = _suivre(loc, "id_s_pref")
+    dept = _suivre(sp, "id_dept")
+    reg = _suivre(dept, "id_reg")
+    return {
+        "id": d.id_denomb,
+        "uuid": d.uuid,
+        "num_questionnaire": d.num_questionnaire,
+        "date_enquete": d.date_enqt,
+        "enqueteur_nom": d.nom_prenom_enqt,
+        "enqueteur_contact": d.contact_enqt,
+        "gps": d.coordonnee_gps,
+        "district": _suivre(reg, "id_dist", "lib_dist"),
+        "region": _suivre(reg, "lib_reg"),
+        "departement": _suivre(dept, "lib_dept"),
+        "sous_prefecture": _suivre(sp, "lib_s_pref"),
+        "secteur": d.secteur_administratif,
+        "zone": _suivre(loc, "id_zone_denombrement", "code_zone"),
+        "localite": _suivre(loc, "lib_loc"),
+        "quartier": _suivre(q, "lib_quar"),
+        "milieu": _suivre(d.id_milieu_residence, "lib_mil"),
+        "code_menage": d.code_men or _suivre(d.id_men, "code_men"),
+        "nb_exploitants": d.nb_exploitant,
+        "a_exploitant": d.a_exploitant,
+        "nom_chef": d.nom_chef_menage,
+        "prenom_chef": d.prenom_chef_menage,
+        "contact_chef": d.contact_chef_menage,
+        "exploitant_present": "Oui" if d.nb_enregistres > 0 else "Non",
+        "est_representant": d.est_repr,
+        "nom_representant": d.nom_repr,
+        "prenom_representant": d.pren_repr,
+        "contact_representant": d.cont_repr,
+        "statut": d.statut,
+        "source": d.source,
+        "cree_le": d.date_creation,
+    }
+
+
+@api_view(["GET"])
+def liste_denombrements(request):
+    qs = avec_details_denomb(denombrements_filtres(request.query_params)).order_by("-id_denomb")
+    pagination = DenombrementPagination()
+    page = pagination.paginate_queryset(qs, request)
+    return pagination.get_paginated_response([_ligne_denombrement(d) for d in page])
+
+
+@api_view(["GET"])
+def stats_denombrements(request):
+    r = denombrements_filtres(request.query_params).aggregate(
+        fiches=Count("id_denomb"),
+        avec_exploitant=Count("id_denomb", filter=Q(a_exploitant__iregex=OUI)),
+        validees=Count("id_denomb", filter=Q(statut__istartswith="valid")),
+        exploitants=Sum(Case(
+            When(nb_exploitant__regex=r"^[0-9]{1,3}$", then=Cast("nb_exploitant", IntegerField())),
+            default=0, output_field=IntegerField(),
+        )),
+    )
+    return Response({
+        "fiches": r["fiches"], "avec_exploitant": r["avec_exploitant"],
+        "validees": r["validees"], "exploitants": r["exploitants"] or 0,
+    })
+
+
+@api_view(["GET"])
+def filtres_denombrements(request):
+    statuts = sorted(
+        Denombrement.objects.exclude(statut__isnull=True).exclude(statut="")
+        .order_by().values_list("statut", flat=True).distinct()
+    )
+    regions = (
+        Region.objects.filter(
+            Q(departement__sousprefecture__localite__quartier__denombrement__isnull=False)
+            | Q(departement__sousprefecture__localite__quartier__menage__denombrement__isnull=False)
+        ).distinct().order_by("lib_reg").values("id_reg", "lib_reg")
+    )
+    return Response({
+        "statuts": statuts,
+        "regions": list(regions),
+        "milieux": list(MilieuResidence.objects.order_by("lib_mil").values("id_milieu", "lib_mil")),
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def export_denombrements(request):
+    """?fmt=xlsx (défaut) | csv. Filtres et `ids` (liste d'identifiants) en GET ou POST."""
+    params = request.POST if request.method == "POST" else request.GET
+    fmt = params.get("fmt", "xlsx").lower()
+    if fmt not in ("xlsx", "csv"):
+        return JsonResponse({"detail": "fmt attendu : xlsx ou csv"}, status=400)
+
+    qs = avec_details_denomb(denombrements_filtres(params)).order_by("-id_denomb")
+    titres = [t for _, t in COLONNES_DENOMB]
+    cles = [k for k, _ in COLONNES_DENOMB]
+    jour = date.today().isoformat()
+
+    def valeurs(d):
+        ligne = _ligne_denombrement(d)
+        return [ligne[k] for k in cles]
+
+    if fmt == "csv":
+        def flux():
+            ecrivain = csv.writer(_Echo(), delimiter=";")
+            yield "\ufeff"
+            yield ecrivain.writerow(titres)
+            for d in qs.iterator(chunk_size=2000):
+                yield ecrivain.writerow([_cellule(v) for v in valeurs(d)])
+        rep = StreamingHttpResponse(flux(), content_type="text/csv; charset=utf-8")
+        rep["Content-Disposition"] = f'attachment; filename="denombrements_{jour}.csv"'
+        return rep
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Dénombrements")
+    _entete_xlsx(ws, titres)
+    n = 0
+    for d in qs.iterator(chunk_size=2000):
+        ws.append([_valeur_xlsx(v) for v in valeurs(d)])
+        n += 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(titres))}{n + 1}"
+    tampon = io.BytesIO()
+    wb.save(tampon)
+    rep = HttpResponse(
+        tampon.getvalue(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    rep["Content-Disposition"] = f'attachment; filename="denombrements_{jour}.xlsx"'
+    return rep
+
+
+@api_view(["GET"])
+def options_geo_denombrements(request, niveau):
+    """Zones présentes dans les dénombrements, restreintes aux filtres déjà cochés."""
+    modeles = {
+        "regions": (Region, "id_reg", "lib_reg", "region_id"),
+        "departements": (Departement, "id_dept", "lib_dept", "departement_id"),
+        "sous-prefectures": (SousPrefecture, "id_s_pref", "lib_s_pref", "sous_prefecture_id"),
+        "localites": (Localite, "id_loc", "lib_loc", "localite_id"),
+    }
+    if niveau not in modeles:
+        return Response({"detail": "Niveau inconnu."}, status=400)
+    modele, champ_id, champ_nom, param = modeles[niveau]
+
+    # On ignore le filtre du niveau demandé : on veut toutes ses options possibles
+    params = request.query_params.copy()
+    for cle in ("q", "statut", "milieu_id", param):
+        params.pop(cle, None)
+    # Les niveaux inférieurs ne restreignent pas les niveaux supérieurs
+    ordre = ["region_id", "departement_id", "sous_prefecture_id", "localite_id"]
+    for cle in ordre[ordre.index(param):]:
+        params.pop(cle, None)
+
+    qs = denombrements_filtres(params)
+    chemin = CHAMPS_GEO_DENOMB[param]
+    ids = set(qs.values_list(f"id_quar__{chemin}", flat=True)) | set(
+        qs.values_list(f"id_men__id_quar__{chemin}", flat=True)
+    )
+    ids.discard(None)
+    objets = (modele.objects.filter(**{f"{champ_id}__in": ids})
+              .order_by(champ_nom).values(champ_id, champ_nom))
+    return Response([{"id": o[champ_id], "nom": o[champ_nom]} for o in objets])
+
+
+# ── Ménages ────────────────────────────────────────────────────────
+
+# paramètre → chemin depuis Menage jusqu'à l'identifiant du niveau
+CHAMPS_GEO_MENAGE = {
+    "region_id": "id_quar__id_loc__id_s_pref__id_dept__id_reg__id_reg",
+    "departement_id": "id_quar__id_loc__id_s_pref__id_dept__id_dept",
+    "sous_prefecture_id": "id_quar__id_loc__id_s_pref__id_s_pref",
+    "zone_id": "id_quar__id_loc__id_zone_denombrement__id_zone",
+    "localite_id": "id_quar__id_loc__id_loc",
+}
+ORDRE_GEO_MENAGE = list(CHAMPS_GEO_MENAGE)
+
+
+def menages_filtres(params):
+    qs = Menage.objects.all()
+
+    # Recherche : code ménage, nom ou prénom d'un exploitant du ménage
+    for mot in params.get("q", "").strip().split()[:5]:
+        qs = qs.filter(
+            Q(code_men__icontains=mot)
+            | Q(id_men__in=Exploitant.objects.filter(
+                Q(nom_expl__icontains=mot) | Q(pren_expl__icontains=mot)
+            ).values("id_men"))
+        )
+
+    for param, chemin in CHAMPS_GEO_MENAGE.items():
+        valeurs = liste_valeurs(params, param)
+        if valeurs:
+            qs = qs.filter(**{f"{chemin}__in": valeurs})
+
+    ids = liste_valeurs(params, "ids")[:50000]
+    if ids:
+        qs = qs.filter(id_men__in=ids)
+    return qs
+
+
+def avec_details_menage(qs):
+    nb = (Exploitant.objects.filter(id_men=OuterRef("id_men")).order_by()
+          .values("id_men").annotate(n=Count("id_expl")).values("n"))
+    geo = "id_loc__id_s_pref__id_dept__id_reg__id_dist"
+    return qs.select_related(
+        f"id_quar__{geo}", "id_quar__id_loc__id_zone_denombrement"
+    ).annotate(nb_reel=Coalesce(Subquery(nb, output_field=IntegerField()), 0))
+
+
+def _ligne_menage(m):
+    q = m.id_quar
+    loc = _suivre(q, "id_loc")
+    sp = _suivre(loc, "id_s_pref")
+    dept = _suivre(sp, "id_dept")
+    reg = _suivre(dept, "id_reg")
+    return {
+        "id": m.id_men, "code_menage": m.code_men,
+        "nom_chef": m.nom_chef, "prenom_chef": m.pren_chef, "contact_chef": m.cont_chef,
+        "nb_enfants": m.nb_enfant, "nb_femmes": m.nb_femme,
+        "nb_personne_en_charge": m.nb_personne_en_charge,
+        "nb_personne_menage": m.nb_personne_menage,
+        "nb_enfant_scolarise": m.nb_enfant_scolarise,
+        "type_batiment": m.type_batiment,
+        "materiaux_murs": m.materiaux_principal_murs,
+        "materiaux_toit": m.materiaux_principal_toit,
+        "type_sanitaire": m.type_sanitaire,
+        "source_combustible": m.source_combustible,
+        "source_eclairage": m.source_eclairage,
+        "source_eau": m.source_eau,
+        "nb_exploitant": m.nb_exploitant,
+        "a_exploitant": m.a_exploitant_anarcade,
+        "distance_sante": m.distance_infr_sante,
+        "distance_ecole": m.distance_etabl_scol,
+        "quartier": _suivre(q, "lib_quar"),
+        "reseau": _suivre(q, "reseau_accessible"),
+        "internet": _suivre(q, "acces_internet"),
+        "infr_sante": _suivre(q, "infrastr_sante"),
+        "banque": _suivre(q, "structure_bancaire"),
+        "localite": _suivre(loc, "lib_loc"),
+        "zone": _suivre(loc, "id_zone_denombrement", "code_zone"),
+        "sous_prefecture": _suivre(sp, "lib_s_pref"),
+        "departement": _suivre(dept, "lib_dept"),
+        "region": _suivre(reg, "lib_reg"),
+        "district": _suivre(reg, "id_dist", "lib_dist"),
+        "nb_exploitants_reel": m.nb_reel,
+    }
+
+
+@api_view(["GET"])
+def liste_menages(request):
+    qs = avec_details_menage(menages_filtres(request.query_params)).order_by("code_men")
+    pagination = MenagePagination()
+    page = pagination.paginate_queryset(qs, request)
+    return pagination.get_paginated_response([_ligne_menage(m) for m in page])
+
+
+@api_view(["GET", "POST"])
+def stats_menages(request):
+    params = request.data if request.method == "POST" else request.query_params
+    base = menages_filtres(params)
+
+    total = base.count()
+    avec = base.filter(
+        exploitant__isnull=False          # si related_name par défaut
+    ).distinct().count()
+    # ou plus explicite :
+    # avec = base.filter(id_men__in=Exploitant.objects.values("id_men")).count()
+
+    return Response({
+        "total": total,
+        "avec": avec,
+        "sans": total - avec,
+    })
+
+
+
+@api_view(["GET"])
+def options_geo_menages(request, niveau):
+    """Zones présentes dans les ménages, restreintes aux niveaux déjà cochés au-dessus."""
+    niveaux = {
+        "regions": (Region, "id_reg", "lib_reg", "region_id"),
+        "departements": (Departement, "id_dept", "lib_dept", "departement_id"),
+        "sous-prefectures": (SousPrefecture, "id_s_pref", "lib_s_pref", "sous_prefecture_id"),
+        "zones": (ZoneDenombrement, "id_zone", "code_zone", "zone_id"),
+        "localites": (Localite, "id_loc", "lib_loc", "localite_id"),
+    }
+    if niveau not in niveaux:
+        return Response({"detail": "Niveau inconnu."}, status=400)
+    modele, champ_id, champ_nom, param = niveaux[niveau]
+
+    params = request.query_params.copy()
+    params.pop("q", None)
+    for cle in ORDRE_GEO_MENAGE[ORDRE_GEO_MENAGE.index(param):]:
+        params.pop(cle, None)
+
+    ids = set(menages_filtres(params).values_list(CHAMPS_GEO_MENAGE[param], flat=True))
+    ids.discard(None)
+    objets = (modele.objects.filter(**{f"{champ_id}__in": ids})
+              .order_by(champ_nom).values(champ_id, champ_nom))
+    return Response([{"id": o[champ_id], "nom": o[champ_nom]} for o in objets])
+
+COLONNES_MENAGE = [
+    ("code_menage", "Code ménage"), ("nom_chef", "Nom chef"), ("prenom_chef", "Prénom chef"),
+    ("contact_chef", "Contact chef"), ("nb_enfants", "Nb enfants"), ("nb_femmes", "Nb femmes"),
+    ("nb_personne_en_charge", "Nb personne en charge"), ("nb_personne_menage", "Nb personne ménage"),
+    ("nb_enfant_scolarise", "Nb enfant scolarisé"), ("type_batiment", "Type bâtiment"),
+    ("materiaux_murs", "Matériaux murs"), ("materiaux_toit", "Matériaux toit"),
+    ("type_sanitaire", "Type sanitaire"), ("source_combustible", "Source combustible"),
+    ("source_eclairage", "Source éclairage"), ("source_eau", "Source eau"),
+    ("nb_exploitant", "Nb exploitant"), ("a_exploitant", "A exploitant anacarde"),
+    ("distance_sante", "Distance infr. santé"), ("distance_ecole", "Distance étab. scolaire"),
+    ("quartier", "Quartier"), ("reseau", "Réseau accessible"), ("internet", "Accès internet"),
+    ("infr_sante", "Infr. santé (quartier)"), ("banque", "Structure bancaire"),
+    ("localite", "Localité"), ("zone", "Zone dénombrement"), ("sous_prefecture", "Sous-préfecture"),
+    ("departement", "Département"), ("region", "Région"), ("district", "District"),
+    ("nb_exploitants_reel", "Nb exploitants du ménage"),
+]
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def export_menages(request):
+    """?fmt=xlsx (défaut) | csv. Filtres et `ids` (liste d'identifiants), en GET ou POST."""
+    params = request.POST if request.method == "POST" else request.GET
+    fmt = params.get("fmt", "xlsx").lower()
+    if fmt not in ("xlsx", "csv"):
+        return JsonResponse({"detail": "fmt attendu : xlsx ou csv"}, status=400)
+
+    qs = avec_details_menage(menages_filtres(params)).order_by("code_men")
+    titres = [t for _, t in COLONNES_MENAGE]
+    cles = [k for k, _ in COLONNES_MENAGE]
+    jour = date.today().isoformat()
+
+    def valeurs(m):
+        ligne = _ligne_menage(m)
+        return [ligne[k] for k in cles]
+
+    if fmt == "csv":
+        def flux():
+            ecrivain = csv.writer(_Echo(), delimiter=";")
+            yield "\ufeff"
+            yield ecrivain.writerow(titres)
+            for m in qs.iterator(chunk_size=2000):
+                yield ecrivain.writerow([_cellule(v) for v in valeurs(m)])
+        rep = StreamingHttpResponse(flux(), content_type="text/csv; charset=utf-8")
+        rep["Content-Disposition"] = f'attachment; filename="menages_{jour}.csv"'
+        return rep
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Ménages")
+    _entete_xlsx(ws, titres)
+    n = 0
+    for m in qs.iterator(chunk_size=2000):
+        ws.append([_valeur_xlsx(v) for v in valeurs(m)])
+        n += 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(titres))}{n + 1}"
+    tampon = io.BytesIO()
+    wb.save(tampon)
+    rep = HttpResponse(
+        tampon.getvalue(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    rep["Content-Disposition"] = f'attachment; filename="menages_{jour}.xlsx"'
+    return rep
+
+# ── SIG : téléchargements massifs par circonscription ──────────────
+
+NIVEAUX_SIG = ["district", "region", "departement", "sous_prefecture", "localite", "quartier"]
+LABEL_NIVEAU = {"district": "District", "region": "Région", "departement": "Département",
+                "sous_prefecture": "Sous-préfecture", "localite": "Localité", "quartier": "Quartier"}
+
+
+class GeoJSON6(Func):
+    """Géométrie exacte, 6 décimales (≈ 10 cm)."""
+    template = "ST_AsGeoJSON(%(expressions)s, 6)"
+    output_field = TextField()
+
+
+@api_view(["GET"])
+def sig_arbre(request):
+    """Arbre administratif à plat : [id, id_parent, nom] par niveau."""
+    return Response({
+        "district": list(District.objects.order_by("lib_dist").values_list("id_dist", "lib_dist")),
+        "region": list(Region.objects.order_by("lib_reg").values_list("id_reg", "id_dist", "lib_reg")),
+        "departement": list(Departement.objects.order_by("lib_dept").values_list("id_dept", "id_reg", "lib_dept")),
+        "sous_prefecture": list(SousPrefecture.objects.order_by("lib_s_pref").values_list("id_s_pref", "id_dept", "lib_s_pref")),
+        "localite": list(Localite.objects.order_by("lib_loc").values_list("id_loc", "id_s_pref", "lib_loc")),
+        "quartier": list(Quartier.objects.filter(id_loc__isnull=False).order_by("lib_quar")
+                         .values_list("id_quar", "id_loc", "lib_quar")),
+    })
+
+
+def resoudre_circonscriptions(params):
+    """
+    Nœuds cochés → zones couvertes. Un nœud couvre tout son sous-arbre.
+    Renvoie des ensembles d'identifiants : district, region, departement,
+    sous_prefecture, localite (couvertes) et quartier (cochés directement).
+    """
+    sel = {n: [int(v) for v in liste_valeurs(params, n)] for n in NIVEAUX_SIG}
+    reg = set(sel["region"])
+    if sel["district"]:
+        reg |= set(Region.objects.filter(id_dist__in=sel["district"]).values_list("id_reg", flat=True))
+    dep = set(sel["departement"])
+    if reg:
+        dep |= set(Departement.objects.filter(id_reg__in=reg).values_list("id_dept", flat=True))
+    sp = set(sel["sous_prefecture"])
+    if dep:
+        sp |= set(SousPrefecture.objects.filter(id_dept__in=dep).values_list("id_s_pref", flat=True))
+    loc = set(sel["localite"])
+    if sp:
+        loc |= set(Localite.objects.filter(id_s_pref__in=sp).values_list("id_loc", flat=True))
+    return {"district": set(sel["district"]), "region": reg, "departement": dep,
+            "sous_prefecture": sp, "localite": loc, "quartier": set(sel["quartier"])}
+
+
+def q_circonscription(c, prefixes):
+    """Filtre « situé dans la sélection », à partir d'un ou plusieurs chemins vers Quartier."""
+    cond = None
+    for p in prefixes:
+        part = Q(**{f"{p}__in": list(c["quartier"])}) | Q(**{f"{p}__id_loc__in": list(c["localite"])})
+        cond = part if cond is None else cond | part
+    return cond
+
+
+class Couche:
+    """champs : (nom court ≤ 10 car., titre, type C/N/F) ; lignes() : ([valeurs], géométrie GeoJSON texte | None)."""
+    def __init__(self, nom, champs, lignes, label=0):
+        self.nom, self.champs, self.lignes, self.label = nom, champs, lignes, label
+
+
+# ── Rubriques géospatiales ──
+
+ADMIN_SIG = [
+    ("district", District, "id_dist", "lib_dist", "geo_dist", None),
+    ("region", Region, "id_reg", "lib_reg", "geom_reg", "id_dist__lib_dist"),
+    ("departement", Departement, "id_dept", "lib_dept", "geom_dept", "id_reg__lib_reg"),
+    ("sous_prefecture", SousPrefecture, "id_s_pref", "lib_s_pref", "geo_s_pref", "id_dept__lib_dept"),
+    ("localite", Localite, "id_loc", "lib_loc", "geo_loc", "id_s_pref__lib_s_pref"),
+    ("quartier", Quartier, "id_quar", "lib_quar", None, "id_loc__lib_loc"),   # pas de géométrie
+]
+
+
+def couches_decoupage(c):
+    couches = []
+    for niveau, modele, f_id, f_nom, f_geom, f_parent in ADMIN_SIG:
+        if niveau == "quartier":
+            qs = modele.objects.filter(Q(id_quar__in=list(c["quartier"])) | Q(id_loc__in=list(c["localite"])))
+        else:
+            qs = modele.objects.filter(**{f"{f_id}__in": list(c[niveau])})
+        qs = qs.order_by(f_nom)
+        if not qs.exists():
+            continue
+        cols = [f_id, f_nom] + ([f_parent] if f_parent else [])
+        if f_geom:
+            qs = qs.annotate(geojson=GeoJSON6(f_geom))
+            cols.append("geojson")
+
+        def lignes(qs=qs, cols=cols, niveau=niveau, f_parent=f_parent, f_geom=f_geom):
+            for r in qs.values_list(*cols).iterator(chunk_size=500):
+                yield ([LABEL_NIVEAU[niveau], r[0], r[1], r[2] if f_parent else None],
+                       r[-1] if f_geom else None)
+
+        couches.append(Couche(niveau, [("niveau", "Niveau", "C"), ("id", "Identifiant", "N"),
+                                       ("nom", "Nom", "C"), ("parent", "Parent", "C")], lignes, label=2))
+    return couches
+
+
+def couche_parcelles(c, statuts):
+    base = "id_expl__id_men__id_quar"
+    loc, sp = f"{base}__id_loc", f"{base}__id_loc__id_s_pref"
+    cond = q_circonscription(c, [base])
+    champs = [("code", "Code parcelle", "C"), ("statut", "Statut", "C"), ("sup_ha", "Superficie (ha)", "F"),
+              ("annee", "Année", "N"), ("code_expl", "Code exploitant", "C"), ("nom_expl", "Exploitant", "C"),
+              ("region", "Région", "C"), ("departem", "Département", "C"), ("sous_pref", "Sous-préfecture", "C"),
+              ("localite", "Localité", "C"), ("quartier", "Quartier", "C"), ("zone_int", "Zone interdite", "C")]
+
+    def lignes():
+        for modele, statut in ((ParcelleCorrecte, "correcte"), (ParcelleIncorrecte, "incorrecte")):
+            if statut not in statuts:
+                continue
+            cols = ["code_parc", "superficie_ha", "annee_mise_place", "id_expl__code_expl",
+                    "id_expl__nom_expl", "id_expl__pren_expl",
+                    f"{sp}__id_dept__id_reg__lib_reg", f"{sp}__id_dept__lib_dept",
+                    f"{sp}__lib_s_pref", f"{loc}__lib_loc", f"{base}__lib_quar"]
+            if modele is ParcelleCorrecte:
+                cols.append("parcelle_zone_interdite")
+            qs = (avec_superficie(modele.objects.filter(cond, geom_parc__isnull=False))
+                  .annotate(geojson=GeoJSON6("geom_parc")).order_by("id_parc")
+                  .values_list(*cols, "geojson"))
+            for r in qs.iterator(chunk_size=1000):
+                nom = ((r[4] or "") + " " + (r[5] or "")).strip() or None
+                zone = r[11] if modele is ParcelleCorrecte else None
+                yield [r[0], statut, r[1], r[2], r[3], nom, r[6], r[7], r[8], r[9], r[10], zone], r[-1]
+
+    return [Couche("parcelles", champs, lignes)]
+
+
+# ── Rubriques attributaires : (titres, générateur de lignes) ──
+
+def rubrique_menages(c):
+    qs = avec_details_menage(Menage.objects.filter(q_circonscription(c, ["id_quar"]))).order_by("code_men")
+    cles = [k for k, _ in COLONNES_MENAGE]
+
+    def lignes():
+        for m in qs.iterator(chunk_size=3000):   # chunk un peu plus gros
+            ligne = _ligne_menage(m)
+            yield [ligne[k] for k in cles]
+    return [t for _, t in COLONNES_MENAGE], lignes()
+
+
+def rubrique_denombrements(c):
+    cond = q_circonscription(c, ["id_quar", "id_men__id_quar"])
+    qs = avec_details_denomb(Denombrement.objects.filter(cond)).order_by("id_denomb")
+    cles = [k for k, _ in COLONNES_DENOMB]
+
+    def lignes():
+        for d in qs.iterator(chunk_size=2000):
+            ligne = _ligne_denombrement(d)
+            yield [ligne[k] for k in cles]
+    return [t for _, t in COLONNES_DENOMB], lignes()
+
+
+# Données d'identité et de pièces : volontairement exclues de l'export de masse
+EXPL_EXCLUS = {"lien_photo", "justificatif_identite", "numero_justicatif", "nb_justificatif_identite",
+               "numero_securite_social", "photo_cmu"}
+
+
+def rubrique_exploitants(c):
+    champs = [f.name for f in Exploitant._meta.concrete_fields
+              if not f.is_relation and f.name not in EXPL_EXCLUS]
+    titres = [n.replace("_", " ").capitalize() for n in champs] + [
+        "Niveau d'instruction", "Code ménage", "Quartier", "Localité", "Sous-préfecture",
+        "Département", "Région", "District", "Nb parcelles"]
+    qs = (Exploitant.objects.filter(q_circonscription(c, ["id_men__id_quar"]))
+          .select_related("id_niv", "id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg__id_dist")
+          .annotate(nb_parcelles=Count("parcellecorrecte")).order_by("code_expl"))
+
+    def lignes():
+        for e in qs.iterator(chunk_size=2000):
+            q = _suivre(e.id_men, "id_quar")
+            loc = _suivre(q, "id_loc")
+            sp = _suivre(loc, "id_s_pref")
+            dept = _suivre(sp, "id_dept")
+            reg = _suivre(dept, "id_reg")
+            yield [getattr(e, n) for n in champs] + [
+                _suivre(e.id_niv, "lib_niv"), _suivre(e.id_men, "code_men"), _suivre(q, "lib_quar"),
+                _suivre(loc, "lib_loc"), _suivre(sp, "lib_s_pref"), _suivre(dept, "lib_dept"),
+                _suivre(reg, "lib_reg"), _suivre(reg, "id_dist", "lib_dist"), e.nb_parcelles]
+    return titres, lignes()
+
+
+# ── Écriture des formats ──
+
+def _json_defaut(o):
+    return float(o) if isinstance(o, Decimal) else str(o)
+
+
+def _xml(v):
+    return xml_escape(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", "" if v is None else str(v)))
+
+
+def _flux_geojson(couches):
+    yield '{"type":"FeatureCollection","features":['
+    premier = True
+    for c in couches:
+        noms = [k for k, _, _ in c.champs]
+        for valeurs, geom in c.lignes():
+            props = json.dumps(dict(zip(noms, valeurs)), default=_json_defaut, ensure_ascii=False)
+            yield ("" if premier else ",") + f'{{"type":"Feature","properties":{props},"geometry":{geom or "null"}}}'
+            premier = False
+    yield "]}"
+
+
+def _kml_geom(g):
+    t = g.get("type")
+    if t == "Point":
+        return f"<Point><coordinates>{g['coordinates'][0]},{g['coordinates'][1]}</coordinates></Point>"
+    if t not in ("Polygon", "MultiPolygon"):
+        return ""
+    ring = lambda r: " ".join(f"{x},{y}" for x, y, *_ in r)
+    polys = [g["coordinates"]] if t == "Polygon" else g["coordinates"]
+    parts = []
+    for rings in polys:
+        trous = "".join(f"<innerBoundaryIs><LinearRing><coordinates>{ring(r)}</coordinates></LinearRing></innerBoundaryIs>"
+                        for r in rings[1:])
+        parts.append(f"<Polygon><outerBoundaryIs><LinearRing><coordinates>{ring(rings[0])}</coordinates>"
+                     f"</LinearRing></outerBoundaryIs>{trous}</Polygon>")
+    return parts[0] if len(parts) == 1 else f"<MultiGeometry>{''.join(parts)}</MultiGeometry>"
+
+
+def _flux_kml(couches):
+    yield ('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+           '<Style id="p"><LineStyle><color>ff452f14</color><width>2</width></LineStyle>'
+           '<PolyStyle><color>664f9a4f</color></PolyStyle></Style>')
+    for c in couches:
+        yield f"<Folder><name>{_xml(c.nom)}</name>"
+        for valeurs, geom in c.lignes():
+            data = "".join(f'<Data name="{k}"><value>{_xml(v)}</value></Data>'
+                           for (k, _, _), v in zip(c.champs, valeurs) if v is not None)
+            forme = _kml_geom(json.loads(geom)) if geom else ""
+            yield (f"<Placemark><name>{_xml(valeurs[c.label])}</name><styleUrl>#p</styleUrl>"
+                   f"<ExtendedData>{data}</ExtendedData>{forme}</Placemark>")
+        yield "</Folder>"
+    yield "</Document></kml>"
+
+
+def _parties_polygone(g):
+    polys = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
+    parties = []
+    for rings in polys:
+        for i, anneau in enumerate(rings):
+            pts = [(float(x), float(y)) for x, y, *_ in anneau]
+            parties.append(_anneau_oriente(pts, horaire=(i == 0)))
+    return parties
+
+
+def _ecrire_shp(dossier, base, couche):
+    """Écrit base.shp/.shx/.dbf/.prj/.cpg. Renvoie False si la couche est vide."""
+    it = iter(couche.lignes())
+    tampon, forme = [], None
+    for valeurs, geom in it:                     # on attend la 1re géométrie pour fixer le type
+        g = json.loads(geom) if geom else None
+        tampon.append((valeurs, g))
+        if g is not None:
+            forme = shapefile.POINT if g["type"] == "Point" else shapefile.POLYGON
+            break
+    if not tampon:
+        return False
+
+    w = shapefile.Writer(os.path.join(dossier, base), shapeType=forme or shapefile.POLYGON, encoding="utf-8")
+    for nom, _, kind in couche.champs:
+        if kind == "N":
+            w.field(nom, "N", size=18, decimal=0)
+        elif kind == "F":
+            w.field(nom, "N", size=18, decimal=6)
+        else:
+            w.field(nom, "C", size=100)
+
+    def ajouter(valeurs, g):
+        if g is None:
+            w.null()
+        elif g["type"] == "Point" and forme == shapefile.POINT:
+            w.point(float(g["coordinates"][0]), float(g["coordinates"][1]))
+        elif g["type"] in ("Polygon", "MultiPolygon") and forme == shapefile.POLYGON:
+            w.poly(_parties_polygone(g))
+        else:
+            w.null()
+        w.record(*[float(v) if isinstance(v, Decimal) else v for v in valeurs])
+
+    for valeurs, g in tampon:
+        ajouter(valeurs, g)
+    for valeurs, geom in it:
+        ajouter(valeurs, json.loads(geom) if geom else None)
+    w.close()
+
+    with open(os.path.join(dossier, f"{base}.prj"), "w") as f:
+        f.write(WKT_WGS84)
+    with open(os.path.join(dossier, f"{base}.cpg"), "w") as f:
+        f.write("UTF-8")
+    return True
+
+
+def _reponse_shp(couches, nom):
+    tmp = tempfile.TemporaryFile()               # supprimé à la fermeture par FileResponse
+    ecrit = False
+    with tempfile.TemporaryDirectory() as dossier:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for c in couches:
+                base = re.sub(r"[^A-Za-z0-9_-]+", "_", c.nom)
+                if _ecrire_shp(dossier, base, c):
+                    ecrit = True
+                    for ext in ("shp", "shx", "dbf", "prj", "cpg"):
+                        z.write(os.path.join(dossier, f"{base}.{ext}"), f"{base}.{ext}")
+    if not ecrit:
+        tmp.close()
+        return JsonResponse({"detail": "Aucune donnée dans cette sélection."}, status=404)
+    tmp.seek(0)
+    return FileResponse(tmp, as_attachment=True, filename=nom, content_type="application/zip")
+
+
+def _reponse_attributs(titres, lignes, fmt, base):
+    if fmt == "csv":
+        def flux():
+            ecr = csv.writer(_Echo(), delimiter=";")
+            yield "\ufeff"
+            yield ecr.writerow(titres)
+            for l in lignes:
+                yield ecr.writerow([_valeur_csv(v) for v in l])
+        rep = StreamingHttpResponse(flux(), content_type="text/csv; charset=utf-8")
+        rep["Content-Disposition"] = f'attachment; filename="{base}.csv"'
+        return rep
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Données")
+    _entete_xlsx(ws, titres)
+    n = 0
+    for l in lignes:
+        ws.append([_valeur_xlsx(v) for v in l])
+        n += 1
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(titres))}{n + 1}"
+    tampon = io.BytesIO()
+    wb.save(tampon)
+    rep = HttpResponse(tampon.getvalue(),
+                       content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    rep["Content-Disposition"] = f'attachment; filename="{base}.xlsx"'
+    return rep
+
+
+@csrf_exempt                      # lecture seule : aucune donnée n'est modifiée
+@require_http_methods(["POST"])
+def export_sig(request):
+    """
+    POST rubrique=decoupage|parcelles|menages|exploitants|denombrements, fmt, 
+    et les nœuds cochés : district, region, departement, sous_prefecture, localite, quartier
+    (identifiants séparés par des virgules). Parcelles : statuts=correcte,incorrecte.
+    """
+    p = request.POST
+    rubrique, fmt = p.get("rubrique", ""), p.get("fmt", "").lower()
+    geo = rubrique in ("decoupage", "parcelles")
+    if not geo and rubrique not in ("menages", "exploitants", "denombrements"):
+        return JsonResponse({"detail": "Rubrique inconnue."}, status=400)
+    if fmt not in (("geojson", "kml", "shp") if geo else ("xlsx", "csv")):
+        return JsonResponse({"detail": "Format non disponible pour cette rubrique."}, status=400)
+
+    c = resoudre_circonscriptions(p)
+    if not any(c.values()):
+        return JsonResponse({"detail": "Aucune circonscription sélectionnée."}, status=400)
+    base = f"{rubrique}_{date.today().isoformat()}"
+
+    if geo:
+        if rubrique == "decoupage":
+            couches = couches_decoupage(c)
+        else:
+            statuts = {s for s in (p.get("statuts") or "").split(",") if s in ("correcte", "incorrecte")}
+            if not statuts:
+                return JsonResponse({"detail": "Choisissez au moins un statut de parcelle."}, status=400)
+            couches = couche_parcelles(c, statuts)
+        if not couches:
+            return JsonResponse({"detail": "Aucune donnée dans cette sélection."}, status=404)
+
+        if fmt == "shp":
+            return _reponse_shp(couches, f"{base}_shp.zip")
+        if fmt == "kml":
+            rep = StreamingHttpResponse(_flux_kml(couches), content_type="application/vnd.google-earth.kml+xml")
+            rep["Content-Disposition"] = f'attachment; filename="{base}.kml"'
+            return rep
+        rep = StreamingHttpResponse(_flux_geojson(couches), content_type="application/geo+json")
+        rep["Content-Disposition"] = f'attachment; filename="{base}.geojson"'
+        return rep
+
+    construire = {"menages": rubrique_menages, "exploitants": rubrique_exploitants,
+                  "denombrements": rubrique_denombrements}[rubrique]
+    titres, lignes = construire(c)
+    return _reponse_attributs(titres, lignes, fmt, base)
