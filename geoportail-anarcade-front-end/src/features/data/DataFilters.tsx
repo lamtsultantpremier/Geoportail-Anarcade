@@ -1,47 +1,32 @@
-import { useFilters } from '../filters/useFilters'
-import { useGeoOptions, type GeoOption } from '../filters/useGeoOptions'
-
-function Select({ label, value, onChange, options, placeholder }: {
-  label: string; value: string; onChange: (v: string) => void
-  options?: GeoOption[]; placeholder: string
-}) {
-  return (
-    <label className="block min-w-[180px]">
-      <span className="mb-1 block text-xs text-muted">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-line bg-white px-3 py-2 text-sm"
-      >
-        <option value="">{placeholder}</option>
-        {options?.map((o) => <option key={o.id} value={String(o.id)}>{o.nom}</option>)}
-      </select>
-    </label>
-  )
-}
+import { toApiParams, toIds, useFilters, withLevel } from '../filters/useFilters'
+import { useGeoOptions } from '../filters/useGeoOptions'
+import GeoMultiSelect from '../denombrements/GeoMultiSelect'
 
 export default function DataFilters() {
   const { filters, setFilters, reset, isFiltered } = useFilters()
+  const { region_id, departement_id, sous_prefecture_id } = toApiParams(filters)
+
   const regions = useGeoOptions('regions')
-  const departments = useGeoOptions('departements', { region_id: filters.region || undefined })
-  const subPrefs = useGeoOptions('sous-prefectures', {
-    region_id: filters.region || undefined,
-    departement_id: filters.department || undefined,
-  })
+  const departments = useGeoOptions('departements', { region_id })
+  const subPrefs = useGeoOptions('sous-prefectures', { region_id, departement_id })
+  const localities = useGeoOptions('localites', { region_id, departement_id, sous_prefecture_id })
 
   return (
-    <div className="flex flex-wrap items-end gap-4 rounded-2xl border border-line bg-white p-4">
-      <Select label="Région" placeholder="Toutes les régions" value={filters.region}
-        options={regions.data}
-        onChange={(v) => setFilters({ ...filters, region: v, department: '', subPrefecture: '', locality: '' })} />
-      <Select label="Département" placeholder="Tous les départements" value={filters.department}
-        options={departments.data}
-        onChange={(v) => setFilters({ ...filters, department: v, subPrefecture: '', locality: '' })} />
-      <Select label="Sous-préfecture" placeholder="Toutes les sous-préfectures" value={filters.subPrefecture}
-        options={subPrefs.data}
-        onChange={(v) => setFilters({ ...filters, subPrefecture: v, locality: '' })} />
+    <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-line bg-white p-4">
+      <GeoMultiSelect label="Région" allLabel="Toutes" selected={toIds(filters.region)}
+        options={regions.data} loading={regions.isLoading}
+        onChange={(ids) => setFilters(withLevel(filters, 'region', ids))} />
+      <GeoMultiSelect label="Département" allLabel="Tous" selected={toIds(filters.department)}
+        options={departments.data} loading={departments.isLoading}
+        onChange={(ids) => setFilters(withLevel(filters, 'department', ids))} />
+      <GeoMultiSelect label="Sous-préf." allLabel="Toutes" selected={toIds(filters.subPrefecture)}
+        options={subPrefs.data} loading={subPrefs.isLoading}
+        onChange={(ids) => setFilters(withLevel(filters, 'subPrefecture', ids))} />
+      <GeoMultiSelect label="Localité" allLabel="Toutes" selected={toIds(filters.locality)}
+        options={localities.data} loading={localities.isLoading}
+        onChange={(ids) => setFilters(withLevel(filters, 'locality', ids))} />
       {isFiltered && (
-        <button onClick={reset} className="pb-2 text-xs text-brand-600 underline">Réinitialiser</button>
+        <button onClick={reset} className="px-2 text-sm font-semibold text-brand-700">Réinitialiser</button>
       )}
     </div>
   )

@@ -28,8 +28,8 @@ export default function MapPage() {
   const fmtInt = (n: number) => new Intl.NumberFormat('fr-FR').format(n)
   const { selectedId } = useUi()
   return (
-    <div className="mx-auto max-w-[1600px]">
-      <div className="mb-6 flex items-center justify-between gap-6">
+    <div className="mx-auto flex h-[calc(100vh-7.5rem)] max-w-[1600px] flex-col">
+      <div className="mb-4 flex shrink-0 items-center justify-between gap-6">
         <div>
           <h1 className="text-3xl font-normal">Explorer les parcelles</h1>
           <p className="text-sm text-muted">
@@ -48,12 +48,13 @@ export default function MapPage() {
 
       <div className={
             selectedId
-            ? 'grid grid-cols-1 gap-6 lg:grid-cols-[280px_1fr_360px]'
-            : 'grid grid-cols-1 gap-6 lg:grid-cols-[280px_1fr]'}>
+            ? 'grid min-h-0 flex-1 grid-cols-1 gap-6 lg:grid-cols-[280px_1fr_360px]'
+            : 'grid min-h-0 flex-1 grid-cols-1 gap-6 lg:grid-cols-[280px_1fr]'}
+            >
         <FilterSidebar />
 
-        <section>
-          <div className="mb-3 flex items-baseline gap-3 text-sm">
+        <section className="flex min-h-0 flex-col">
+          <div className="mb-3 shrink-0 flex items-baseline gap-3 text-sm">
             {stats.isError ? (
               <span className="text-red-700">Impossible de charger les compteurs.</span>
             ) : (
@@ -67,7 +68,7 @@ export default function MapPage() {
             </span>
             </>)}
         </div>
-          <div className="h-[560px] overflow-hidden rounded-2xl border border-line bg-white">
+          <div className="min-h-0 flex-1 overflow-hidden rounded-2xl border border-line bg-white">
               <MapView filters={filters} isFiltered={isFiltered} />
           </div>
         </section>

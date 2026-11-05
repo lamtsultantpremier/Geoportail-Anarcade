@@ -17,10 +17,14 @@ export function useFilterLabels(f: Filters) {
   const p = toApiParams(f)
   const regions = useGeoOptions('regions')
   const departments = useGeoOptions('departements', { region_id: p.region_id })
-  const find = (list: GeoOption[] | undefined, id: string) =>
-    list?.find((o) => String(o.id) === id)?.nom
+  const names = (list: GeoOption[] | undefined, csv: string) => {
+    const ids = csv ? csv.split(',') : []
+    if (ids.length === 0) return undefined
+    if (ids.length > 1) return `${ids.length} sélectionnés`
+    return list?.find((o) => String(o.id) === ids[0])?.nom
+  }
   return {
-    region: find(regions.data, f.region),
-    department: find(departments.data, f.department),
+    region: names(regions.data, f.region),
+    department: names(departments.data, f.department),
   }
 }

@@ -46,3 +46,16 @@ export function useFilters() {
 
   return { filters, setFilters, reset, isFiltered }
 }
+
+// "3,7,12" → ['3','7','12']
+export const toIds = (s: string) => (s ? s.split(',').filter(Boolean) : [])
+
+export const FILTER_ORDER = ['region', 'department', 'subPrefecture', 'locality'] as const
+export type GeoKey = typeof FILTER_ORDER[number]
+
+// Change un niveau et vide ceux du dessous
+export function withLevel(f: Filters, key: GeoKey, ids: string[]): Filters {
+  const next: Filters = { ...f, [key]: ids.join(',') }
+  FILTER_ORDER.slice(FILTER_ORDER.indexOf(key) + 1).forEach((k) => { next[k] = '' })
+  return next
+}

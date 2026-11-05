@@ -1,68 +1,43 @@
-import { useState } from 'react'
-import { Filter, SlidersHorizontal, Sprout } from 'lucide-react'
-import { EMPTY_FILTERS, toApiParams, useFilters, type Filters } from './useFilters'
-import { useGeoOptions, type GeoOption } from './useGeoOptions'
+import { useEffect, useState } from 'react'
+import { SlidersHorizontal, Sprout } from 'lucide-react'
+import { toApiParams, toIds, useFilters, withLevel } from './useFilters'
+import { useGeoOptions } from './useGeoOptions'
 import { useUi } from '../../lib/store'
+import GeoMultiSelect from '../denombrements/GeoMultiSelect'
 
-const Label = ({ children }: { children: React.ReactNode }) => (
-  <label className="mb-1.5 mt-4 block text-xs text-muted">{children}</label>
-)
-
-const selectCls = 'w-full rounded-lg border border-line bg-white px-3 py-2.5 text-sm'
-
-function FilterSelect({ label, value, onChange, options, loading, placeholder }: {
-  label: string
-  value: string
-  onChange: (v: string) => void
-  options?: GeoOption[]
-  loading: boolean
-  placeholder: string
-}) {
-  return (
-    <>
-      <Label>{label}</Label>
-      <select className={selectCls} value={value} onChange={(e) => onChange(e.target.value)}>
-        <option value="">{loading ? 'Chargement…' : placeholder}</option>
-        {options?.map((o) => (
-          <option key={o.id} value={String(o.id)}>{o.nom}</option>
-        ))}
-      </select>
-    </>
-  )
-}
+const inputCls = 'w-full rounded-lg border border-line bg-white px-3 py-2.5 text-sm'
 
 export default function FilterSidebar() {
-  const { filters, setFilters, reset } = useFilters()
-  const [draft, setDraft] = useState<Filters>(filters)
+  const { filters, setFilters, reset, isFiltered } = useFilters()
   const { layers, toggleLayer } = useUi()
 
-  // Chaque liste dépend des choix faits au-dessus d'elle
-  const { region_id, departement_id, sous_prefecture_id } = toApiParams(draft)
+  // Superficie : appliquée à la sortie du champ ou avec Entrée
+  const [min, setMin] = useState(String(filters.min))
+  const [max, setMax] = useState(String(filters.max))
+  useEffect(() => { setMin(String(filters.min)); setMax(String(filters.max)) }, [filters.min, filters.max])
+  const applyArea = () => setFilters({ ...filters, min: Number(min) || 0, max: Number(max) || 100 })
+
+  const { region_id, departement_id, sous_prefecture_id } = toApiParams(filters)
   const regions = useGeoOptions('regions')
   const departments = useGeoOptions('departements', { region_id })
   const subPrefs = useGeoOptions('sous-prefectures', { region_id, departement_id })
   const localities = useGeoOptions('localites', { region_id, departement_id, sous_prefecture_id })
 
-  const set = (patch: Partial<Filters>) => setDraft({ ...draft, ...patch })
-
   const layerList = [
     { key: 'regions', label: 'Regions', sub: 'Regions en Côte d Ivoire' },
-    { key: 'zone', label: "Zones interdites", sub: 'Zone Interdites' },
-    // { key: 'base', label: 'Forêts classées', sub: 'Zones Protégées' },
-    // { key: 'admin', label: 'Limites administratives', sub: 'Régions et départements' },
+    { key: 'zone', label: 'Zones interdites', sub: 'Zone Interdites' },
   ]
 
   return (
     <aside className="h-fit rounded-2xl border border-line bg-white p-5">
-         <div className="mt-6 border-t border-line pt-5">
+      <div className="mt-2 border-b border-line pb-5">
         <div className="mb-3 flex justify-between text-sm">
           <span className="font-medium">Couches SIG</span>
           <span className="text-xs text-muted">{layerList.length} couches</span>
         </div>
         {layerList.map((l) => (
           <label key={l.key} className="mb-3 flex cursor-pointer items-start gap-3">
-            <input type="checkbox" className="mt-1"
-              checked={layers[l.key]} onChange={() => toggleLayer(l.key)} />
+            <input type="checkbox" className="mt-1" checked={layers[l.key]} onChange={() => toggleLayer(l.key)} />
             <span className="text-sm leading-tight">
               {l.label}
               <span className="block text-xs text-muted">{l.sub}</span>
@@ -70,16 +45,14 @@ export default function FilterSidebar() {
           </label>
         ))}
       </div>
-      <div className="flex items-center justify-between">
+
+      <div className="mt-5 flex items-center justify-between">
         <span className="flex items-center gap-2 font-medium">
           <SlidersHorizontal size={16} /> Filtres
         </span>
-        <button
-          onClick={() => { reset(); setDraft(EMPTY_FILTERS) }}
-          className="text-xs text-brand-600"
-        >
-          Réinitialiser
-        </button>
+        {isFiltered && (
+          <button onClick={reset} className="text-xs text-brand-600">Réinitialiser</button>
+        )}
       </div>
 
       {regions.isError && (
@@ -88,48 +61,35 @@ export default function FilterSidebar() {
         </p>
       )}
 
-      <FilterSelect
-        label="Région" placeholder="Toutes les régions"
-        value={draft.region} options={regions.data} loading={regions.isLoading}
-        onChange={(v) => set({ region: v, department: '', subPrefecture: '', locality: '' })}
-      />
-      <FilterSelect
-        label="Département" placeholder="Tous les départements"
-        value={draft.department} options={departments.data} loading={departments.isLoading}
-        onChange={(v) => set({ department: v, subPrefecture: '', locality: '' })}
-      />
-      <FilterSelect
-        label="Sous-préfecture" placeholder="Toutes les sous-préfectures"
-        value={draft.subPrefecture} options={subPrefs.data} loading={subPrefs.isLoading}
-        onChange={(v) => set({ subPrefecture: v, locality: '' })}
-      />
-      <FilterSelect
-        label="Localité" placeholder="Toutes les localités"
-        value={draft.locality} options={localities.data} loading={localities.isLoading}
-        onChange={(v) => set({ locality: v })}
-      />
+      <div className="mt-4 space-y-3">
+        <GeoMultiSelect label="Région" allLabel="Toutes" selected={toIds(filters.region)}
+          options={regions.data} loading={regions.isLoading}
+          onChange={(ids) => setFilters(withLevel(filters, 'region', ids))} />
+        <GeoMultiSelect label="Département" allLabel="Tous" selected={toIds(filters.department)}
+          options={departments.data} loading={departments.isLoading}
+          onChange={(ids) => setFilters(withLevel(filters, 'department', ids))} />
+        <GeoMultiSelect label="Sous-préf." allLabel="Toutes" selected={toIds(filters.subPrefecture)}
+          options={subPrefs.data} loading={subPrefs.isLoading}
+          onChange={(ids) => setFilters(withLevel(filters, 'subPrefecture', ids))} />
+        <GeoMultiSelect label="Localité" allLabel="Toutes" selected={toIds(filters.locality)}
+          options={localities.data} loading={localities.isLoading}
+          onChange={(ids) => setFilters(withLevel(filters, 'locality', ids))} />
+      </div>
 
-      <Label>Superficie (ha)</Label>
+      <label className="mb-1.5 mt-5 block text-xs text-muted">Superficie (ha)</label>
       <div className="flex gap-2">
-        <input type="number" className={selectCls} value={draft.min}
-          onChange={(e) => set({ min: Number(e.target.value) })} />
-        <input type="number" className={selectCls} value={draft.max}
-          onChange={(e) => set({ max: Number(e.target.value) })} />
+        <input type="number" className={inputCls} value={min} min={0}
+          onChange={(e) => setMin(e.target.value)} onBlur={applyArea}
+          onKeyDown={(e) => e.key === 'Enter' && applyArea()} />
+        <input type="number" className={inputCls} value={max} min={0}
+          onChange={(e) => setMax(e.target.value)} onBlur={applyArea}
+          onKeyDown={(e) => e.key === 'Enter' && applyArea()} />
       </div>
 
       <div className="mt-4 flex items-center gap-2 text-xs text-muted">
         <Sprout size={14} className="text-brand-600" /> Culture
         <span className="rounded-md bg-brand-50 px-2 py-0.5 font-medium text-brand-700">Anacarde</span>
       </div>
-
-      <button
-        onClick={() => setFilters(draft)}
-        className="mt-5 flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-brand-700"
-      >
-        <Filter size={16} /> Appliquer les filtres
-      </button>
-
-   
     </aside>
   )
 }
