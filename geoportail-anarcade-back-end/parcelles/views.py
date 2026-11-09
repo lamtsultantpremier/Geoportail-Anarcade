@@ -42,8 +42,11 @@ from .models import (
     ParcelleIncorrecte,
     Denombrement, 
     MilieuResidence,
-     Menage, 
-     ZoneDenombrement
+    Menage, 
+    ZoneDenombrement,
+    Denombrement, 
+    PieceJustificatif,
+    ParcelleInfo,
 )
 
 from django.db.models import Func, TextField
@@ -76,6 +79,8 @@ import shapefile  # pyshp
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from .models import ImportLot, ImportParcelle
+
+
 
 class AsGeoJSON(Func):
     function = "ST_AsGeoJSON"
@@ -658,6 +663,47 @@ def _url_photo(lien):
     return settings.MEDIA_URL.rstrip("/") + "/" + lien.lstrip("/")
 
 
+# (clé de sortie, champ de parcelle_info, champ équivalent de parcelle_correcte)
+CHAMPS_DETAIL_PARCELLE = [
+    ("surface_utilisee", "surface_utilise", "surface_utilise"),
+    ("jachere", "superficie_mise_en_jachere", "surface_mis_en_jachere"),
+    ("en_production", "superficie_en_production", "superficie_en_production"),
+    ("non_en_production", "superficie_non_en_production", "superficie_non_en_production"),
+    ("culture_principale", "anarcade_culture_principal", "anarcade_culture_principal"),
+    ("culture_associee", "culture_associe", "culture_associe"),
+    ("nb_entretiens", "nb_entretiens_par_campagne", "nb_entretiens_par_campagne"),
+    ("provenance_plants", "provenance_materiel_vegetal", "provenance_materiel_vegetal"),
+    ("certification", "certification", "certification"),
+    ("acces_conseil", "access_service_conseil", "access_service_conseil"),
+    ("service_conseil", "service_conseil_utilise", "service_conseil_utilise"),
+    ("rehabilitation", "rehabilitation_effectue", "rehabilitation_effectue"),
+    ("sup_rehabilitee", "superficie_rehabilite", "superficie_rehabilite"),
+    ("engrais", "utilisation_engrais", "utilisation_engrais"),
+    ("phyto", "traitement_phytosanitaire", "traitement_phytosanitaire"),
+    ("prix_engrais", "prix_engrais", "prix_engrais"),
+    ("prix_entretien", "prix_entretien_parcelle", "prix_entretien_parcelle"),
+    ("prix_pesticide", "prix_persticide", "prix_persticide"),
+    ("prix_materiel", "prix_materiel_agricole", "prix_materiel_agricole"),
+    ("effectif_permanent", "effectif_permanent", "effectif_permanent"),
+    ("frequence_permanent", "frequence_permanent", None),
+    ("salaire_permanent", "salaire_main_oeuvre_permanent", "salaire_main_oeuvre_permanent"),
+    ("effectif_contractuel", "effectif_contractuel", "effectif_contractuel"),
+    ("frequence_contractuel", "nb_frequence_contractuel", "nb_frequence_contractuel"),
+    ("zone_interdite", "parcelle_zone_interdite", "parcelle_zone_interdite"),
+]
+
+
+def _details_parcelle(parcelle, info):
+    """Détails agronomiques : parcelle_info en priorité, parcelle_correcte en secours."""
+    out = {}
+    for cle, champ_info, champ_correcte in CHAMPS_DETAIL_PARCELLE:
+        valeur = getattr(info, champ_info, None) if info else None
+        if valeur in (None, "") and champ_correcte:
+            valeur = getattr(parcelle, champ_correcte, None)
+        out[cle] = valeur
+    return out
+
+
 @api_view(["GET"])
 def fiche_parcelle(request, id_parc):
     """Parcelle + localisation + exploitant + enquêteur + enquête, en un appel."""
@@ -990,7 +1036,8 @@ def fiche_exploitant(request, id_expl):
     exploitant = get_object_or_404(
         Exploitant.objects.select_related(
             "id_niv",
-            "id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg",
+            "id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg__id_dist",
+            "id_men__id_quar__id_loc__id_zone_denombrement",
         ),
         id_expl=id_expl,
     )
@@ -1007,6 +1054,12 @@ def fiche_exploitant(request, id_expl):
     )
 
     ids_parcelles = [p.id_parc for p in parcelles]
+
+    infos = {}
+    for inf in ParcelleInfo.objects.filter(
+        code_parcel__in=[p.code_parc for p in parcelles]
+    ).order_by("id_parcel"):
+        infos[inf.code_parcel] = inf          # en cas de doublon, la ligne la plus récente gagne
 
     dates_georeferencement = {}
     for g in (
@@ -1073,6 +1126,8 @@ def fiche_exploitant(request, id_expl):
             "date_georeferencement": _iso(
                 dates_georeferencement.get(p.id_parc)
             ),
+
+            "details": _details_parcelle(p, infos.get(p.code_parc)),
         })
 
     superficie_totale = sum(p["superficie_ha"] or 0 for p in liste)
@@ -1080,7 +1135,7 @@ def fiche_exploitant(request, id_expl):
     departements = sorted({p["departement"] for p in liste if p["departement"]})
     regions = sorted({p["region"] for p in liste if p["region"]})
 
-    return Response({
+    data = {
         "exploitant": {
             "id": exploitant.id_expl,
             "code": exploitant.code_expl,
@@ -1120,7 +1175,104 @@ def fiche_exploitant(request, id_expl):
             "sous_prefectures": sous_prefectures,
         },
         "parcelles": liste,
+    }
+
+    e = exploitant
+    district = _suivre(region, "id_dist")
+    denomb = (
+        Denombrement.objects.filter(id_men=menage.id_men)
+        .select_related("id_milieu_residence").order_by("-id_denomb").first()
+    ) if menage else None
+
+    data["exploitant"].update({
+        "sexe": e.sexe,
+        "formation_agricole": e.formation_agricole,
+        "justificatif_identite": e.justificatif_identite,
+        "numero_justificatif": e.numero_justicatif,
+        "nb_justificatifs": e.nb_justificatif_identite,
+        "beneficie_cmu": e.benificie_cmu,
+        "numero_securite_sociale": e.numero_securite_social,
+        "compte_mobile": e.compte_mobile,
+        "photo_cmu": e.photo_cmu,
+        "photo_chemin": e.lien_photo,
     })
+
+    data["residence"].update({
+        "district": _suivre(district, "lib_dist"),
+        "zone": _suivre(localite, "id_zone_denombrement", "code_zone"),
+        "milieu": _suivre(denomb, "id_milieu_residence", "lib_mil"),
+    })
+
+    data["menage"].update({
+        "code": _suivre(menage, "code_men"),
+        "nb_personnes": _suivre(menage, "nb_personne_menage"),
+        "nb_en_charge": _suivre(menage, "nb_personne_en_charge"),
+        "nb_scolarises": _suivre(menage, "nb_enfant_scolarise"),
+        "a_exploitant": _suivre(menage, "a_exploitant_anarcade"),
+        "nb_exploitants_reel": (
+            Exploitant.objects.filter(id_men=menage.id_men).count() if menage else None
+        ),
+        "distance_sante": _suivre(menage, "distance_infr_sante"),
+        "distance_ecole": _suivre(menage, "distance_etabl_scol"),
+    })
+
+    data["habitat"] = {
+        "type_batiment": _suivre(menage, "type_batiment"),
+        "murs": _suivre(menage, "materiaux_principal_murs"),
+        "toit": _suivre(menage, "materiaux_principal_toit"),
+        "sanitaire": _suivre(menage, "type_sanitaire"),
+        "combustible": _suivre(menage, "source_combustible"),
+        "eclairage": _suivre(menage, "source_eclairage"),
+        "eau": _suivre(menage, "source_eau"),
+    }
+    data["quartier_services"] = {
+        "reseau": _suivre(quartier, "reseau_accessible"),
+        "internet": _suivre(quartier, "acces_internet"),
+        "infr_sante": _suivre(quartier, "infrastr_sante"),
+        "banque": _suivre(quartier, "structure_bancaire"),
+    }
+
+    data["socio"] = {
+        "compte_bancaire": e.a_compte_bancaire,
+        "raison_absence_compte": e.raison_absence_compte_bancaire,
+        "montant_mensuel": e.montant_mensuel_transaction,
+        "montant_max": e.montant_max_transaction,
+        "depense_sante": e.depense_sante,
+        "mobile_money": e.a_deja_utilise_compte_mobile_money,
+        "raison_absence_mobile_money": e.raison_absence_compte_mobile_money,
+        "membre_organisation": e.appartient_a_organisation_producteur,
+        "type_organisation": e.type_organisation,
+        "specialisation": e.specialisation_organisation,
+        "tontine": e.participe_a_tontine,
+        "type_tontine": e.type_tontine,
+        "montant_tontine": e.montant_tontine,
+        "batiment_stockage": e.a_batiment_stockage,
+        "capacite_stockage": e.capacite_stockage,
+        "machine_agricole": e.a_machine_agricole,
+        "machine_agricole_detail": e.machine_agricole,
+        "sechage": e.equipement_sechage,
+        "brouettes": e.nb_brouette, "machettes": e.nb_machette,
+        "atomisateurs": e.nb_atomisateur, "balances": e.nb_bascule,
+        "tronconneuses": e.nb_tronconneuse, "automobiles": e.nb_atomobile,
+        "motocyclettes": e.nb_motocyclette, "tricycles": e.nb_tricycle,
+        "animaux_trait": e.nb_animaux_trait, "charrettes": e.nb_charette,
+        "bicyclettes": e.nb_bicyclette, "autres_materiels": e.nb_autre_materiel,
+    }
+
+    data["pieces"] = [
+        {
+            "type": p.type_piece, "numero": p.numero_piece, "chemin": p.chemin_photo,
+            "photo_url": _url_photo(p.chemin_photo),
+            "date": p.date_enregistrement.isoformat() if p.date_enregistrement else None,
+        }
+        for p in PieceJustificatif.objects.filter(id_expl=e.id_expl).order_by("-date_enregistrement")
+    ]
+    data["exploitant"]["photo_cmu_url"] = _url_photo(e.photo_cmu)
+    return Response(data)
+
+
+
+
 
 # ── Données : synthèse ─────────────────────────────────────────────
 

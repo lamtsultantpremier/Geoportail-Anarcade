@@ -106,16 +106,18 @@ urlpatterns = [
     path("parcelles/<int:id_parc>/",fiche_parcelle,name="fiche-parcelle"),
     path("parcelles/recherche/",recherche_parcelles,name="recherche-parcelles"),
     path("parcelles/export/",export_parcelles,name="export-parcelles"),
-    path("exploitants/", liste_exploitants_api, name="liste-exploitants"),
-    path("exploitants/<int:id_expl>/", fiche_exploitant, name="fiche-exploitant"),
+    path("parcelles/<int:id_parc>/export/", export_geometrie_parcelle, name="export-geometrie-parcelle"),
+
+    
     path("donnees/synthese/", donnees_synthese, name="donnees-synthese"),
+    path("donnees/enquetes/", donnees_enquetes, name="donnees-enquetes"),
     path("donnees/repartition/", donnees_repartition, name="donnees-repartition"),
     path("donnees/structure/", donnees_structure, name="donnees-structure"),
     path("donnees/profil/", donnees_profil, name="donnees-profil"),
-    path("donnees/enquetes/", donnees_enquetes, name="donnees-enquetes"),
     path("donnees/recapitulatif/", donnees_recapitulatif, name="donnees-recapitulatif"),
-    path("parcelles/<int:id_parc>/export/", export_geometrie_parcelle, name="export-geometrie-parcelle"),
-
+    
+    path("exploitants/<int:id_expl>/", fiche_exploitant, name="fiche-exploitant"),
+    path("exploitants/", liste_exploitants_api, name="liste-exploitants"),
     # -------------- Version 2 de la plateforme ------------------------------------
     path('regions/geojson/',liste_regions_geojson,name="liste_region"),
     path("exploitants/export/", export_exploitants, name="export-exploitants"),
