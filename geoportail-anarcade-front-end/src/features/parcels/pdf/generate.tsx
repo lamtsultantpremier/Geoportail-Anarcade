@@ -83,6 +83,10 @@ async function buildExploitantPdf(
     ? await loadPhoto(d.exploitant.photo_url)
     : null
 
+  const pieceImages = await Promise.all(
+    d.pieces.map((p) => (p.photo_url ? loadPhoto(p.photo_url) : Promise.resolve(null))),
+  )
+
   const basemap =
     BASEMAPS.find((b) => b.id === options.basemap) ?? BASEMAPS[0]
 
