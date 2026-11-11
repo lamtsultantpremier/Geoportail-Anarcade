@@ -125,6 +125,7 @@ async function buildExploitantPdf(
         overview: overviewMap,
         parcels: parcelMaps,
       }}
+      pieceImages={pieceImages}
     />,
   ).toBlob()
 }

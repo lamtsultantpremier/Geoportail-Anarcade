@@ -26,7 +26,7 @@ export interface DenombRow {
   statut: S; source: S; cree_le: S
 }
 
-export interface DenombStats { fiches: number; avec_exploitant: number; validees: number; exploitants: number }
+export interface DenombStats { fiches: number; avec_exploitant: number;sans_exploitant:number;validees: number; exploitants: number}
 
 export interface DenombOptions {
   statuts: string[]

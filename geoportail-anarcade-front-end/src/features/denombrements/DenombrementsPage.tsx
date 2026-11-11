@@ -270,9 +270,11 @@ const changeGeo = (key: typeof GEO[number], ids: string[]) => {
 
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Kpi icon={<ClipboardList size={16} />} label="Opérations de Dénombrements" value={stats.data?.fiches} caption="Selon les filtres actifs" />
-        <Kpi icon={<Home size={16} />} label="Ménages avec exploitant" value={stats.data?.avec_exploitant} caption="Déclarés dans le ménage" />
+        <Kpi icon={<Home size={16} />} label="Ménages avec exploitant" value={stats.data?.avec_exploitant} caption="Déclarés par le ménage" />
+        <Kpi icon={<Home size={16} />} label="Ménages sans exploitant" value={stats.data?.sans_exploitant} caption="Déclarés dans le ménage" />
         {/* <Kpi icon={<Check size={16} />} label="Enquêtes validées" value={stats.data?.validees} caption="Statut de la fiche" /> */}
-        <Kpi icon={<Users size={16} />} label="Exploitants recensés" value={stats.data?.exploitants} caption="Somme des effectifs déclarés" />
+        <Kpi icon={<Users size={16} />} label="Exploitants recensés" value={stats.data?.exploitants} caption="Somme des effectifs déclarés par le ménage" />
+        
       </div>
 
       <section className="rounded-2xl border border-line bg-white">

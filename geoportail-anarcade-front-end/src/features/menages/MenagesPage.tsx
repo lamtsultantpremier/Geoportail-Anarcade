@@ -1,6 +1,6 @@
 import { useEffect, useState,useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Home, Loader2, Search, UserCheck, UserX ,ChevronDown, Download, FileSpreadsheet, FileText} from 'lucide-react'
+import { Home, Loader2, Search, UserCheck, UserX ,ChevronDown, Download, FileSpreadsheet, FileText,UserX2} from 'lucide-react'
 import { formatPhone, titleCase } from '../../lib/format'
 import Pagination from '../exploitants/Pagination'
 import GeoMultiSelect from '../denombrements/GeoMultiSelect'
@@ -249,13 +249,15 @@ const togglePage = () =>
                 </div>
                 <ExportMenu filters={filters} count={count} selected={selIds} />
         </div>
-      <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
+      <div className="mb-6 grid grid-cols-1 gap-2 md:grid-cols-4">
        <Kpi tone="blue" icon={<Home size={16} />} label="Total ménages" value={shown?.total}
             caption={hasSel ? 'Ménages sélectionnés' : 'Ménages correspondant aux filtres actifs'} />
-        <Kpi tone="green" icon={<UserCheck size={16} />} label="Ménages avec exploitants" value={shown?.avec}
+        <Kpi tone="green" icon={<Home size={16} />} label="Ménages avec Au moins un exploitant" value={shown?.avec}
             caption={hasSel ? 'Dans la sélection' : 'Au moins un exploitant enregistré'} />
-        <Kpi tone="red" icon={<UserX size={16} />} label="Ménages sans exploitants" value={shown?.sans}
-            caption={hasSel ? 'Dans la sélection' : 'Aucun exploitant enregistré'} />
+        <Kpi tone="orange" icon={<Home size={16} />} label="Ménages Avec plusieurs exploitants" value={shown?.avec_plusieurs}
+            caption={hasSel ? 'Dans la sélection' : 'Avec plusieurs exploitants enregistrés'} />
+        <Kpi tone="red" icon={<UserX2 size={16} />} label="Total exploitants" value={shown?.exploitants}
+            caption={hasSel ? 'Dans la sélection' : 'Total d\'exploitant dans tous les ménages confondus'} />
       </div>
 
       <section className="rounded-2xl border border-line bg-white">

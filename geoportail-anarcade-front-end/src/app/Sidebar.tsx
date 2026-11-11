@@ -6,6 +6,8 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 
+import { useAuth,} from '../features/admin/auth'
+
 // Classes écrites en entier : Tailwind ne génère pas les noms construits dynamiquement
 const TONES = {
   orange: { icon: 'text-orange-400', active: 'bg-orange-500/20 text-orange-100 ring-1 ring-orange-500/50', bar: 'bg-orange-500' },
@@ -15,19 +17,24 @@ const TONES = {
 } as const
 type Tone = keyof typeof TONES
 
-interface Item { to: string; label: string; icon: typeof Home; tone: Tone; end?: boolean }
+interface Item { to: string; label: string; 
+                icon: typeof Home; 
+                tone: Tone; 
+                end?: boolean ,
+                superOnly?:boolean,
+                droit?: string}
 
 const MAIN: Item[] = [
-  { to: '/denombrements', label: 'Dénombrements', icon: ClipboardList, tone: 'orange' },
-  { to: '/menages', label: 'Ménages', icon: Home, tone: 'green' },
-  { to: '/', label: 'Carte', icon: MapIcon, tone: 'red', end: true },
-  { to: '/exploitants', label: 'Exploitants', icon: Users, tone: 'blue' },
-  { to: '/data', label: 'Statiques', icon: ChartSpline, tone: 'orange' },
-  { to: '/data-sent', label: 'Données validées', icon: CheckCheck, tone: 'green' },
-  { to: '/sig', label: 'SIG', icon: Crosshair, tone: 'red' },
+  { to: '/denombrements', label: 'Dénombrements', icon: ClipboardList, tone: 'orange' , droit: 'voir_denombrement'},
+  { to: '/menages', label: 'Ménages', icon: Home, tone: 'green',droit: 'voir_menage' },
+  { to: '/', label: 'Carte', icon: MapIcon, tone: 'red', end: true ,droit: 'voir_carte'},
+  { to: '/exploitants', label: 'Exploitants', icon: Users, tone: 'blue',droit: 'voir_exploitants' },
+  { to: '/data', label: 'Statiques', icon: ChartSpline, tone: 'orange' ,droit: 'voir_statistique'},
+  { to: '/data-sent', label: 'Données validées', icon: CheckCheck, tone: 'green' ,droit: 'voir_donnees_validees'},
+  { to: '/sig', label: 'SIG', icon: Crosshair, tone: 'red',droit: 'exporter' },
 ]
 
-const ADMIN: Item = { to: '/administration', label: 'Administration', icon: Settings, tone: 'blue' }
+const ADMIN: Item = { to: '/administration', label: 'Administration', icon: Settings, tone: 'blue',droit: 'acces_admin' }
 
 function Link({ item, onNavigate }: { item: Item; onNavigate: () => void }) {
   const t = TONES[item.tone]
@@ -56,6 +63,14 @@ function Link({ item, onNavigate }: { item: Item; onNavigate: () => void }) {
 }
 
 export default function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
+  
+const user = useAuth((s) => s.user)
+
+
+const isSuper = user?.role === 'Super-admin'
+const can = (i: Item) => (!i.superOnly || isSuper) && (!i.droit || !!user?.droits.includes(i.droit))
+const main = MAIN.filter(can)
+
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -98,7 +113,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
         </div>
 
         <nav className="flex flex-1 flex-col gap-1.5 overflow-y-auto pl-3">
-          {MAIN.map((item) => <Link key={item.to} item={item} onNavigate={onClose} />)}
+          {main.map((item) => <Link key={item.to} item={item} onNavigate={onClose} />)}
         </nav>
 
         <div className="border-t border-white/10 pl-3 pt-3">

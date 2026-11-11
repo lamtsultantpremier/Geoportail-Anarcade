@@ -23,7 +23,7 @@ export interface MenageRow {
   nb_exploitants_reel: number
 }
 
-export interface MenageStats { total: number; avec: number; sans: number }
+export interface MenageStats { total: number; avec: number; sans: number ,exploitants:number,avec_plusieurs:number}
 export type MenageGeoLevel = 'regions' | 'departements' | 'sous-prefectures' | 'zones' | 'localites'
 export const PAGE_SIZES = [25, 50, 100]
 

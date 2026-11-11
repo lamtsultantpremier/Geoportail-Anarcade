@@ -9,6 +9,8 @@ import { useState } from 'react'
 import ReplaceDialog from './ReplaceDialog'
 import { fetchPreview, type Preview } from './useImportPreview'
 
+import { useAuth,} from '../admin/auth'
+
 const nf = new Intl.NumberFormat('fr-FR')
 
 const BADGE: Record<ImportedFile['statut'], { label: string; cls: string }> = {
@@ -24,6 +26,10 @@ export default function DataSentPage() {
     files, features, selectedUid, loading, error, busyLot,
     select, refresh, publish, cancel, remove, openImport,
   } = useImports()
+
+  const droits = useAuth((s) => s.user?.droits ?? [])
+  const canPublish = droits.includes('publier')
+  const canImport = droits.includes('importer')
 
   useEffect(() => { void refresh() }, [refresh])
 
@@ -78,10 +84,10 @@ const onConfirmReplace = async (rangs: number[]) => {
               : 'Fichiers importés, contrôlés puis publiés dans la base'}
           </p>
         </div>
-        <button onClick={openImport}
+        {canImport && (<button onClick={openImport}
           className="flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-brand-700">
           <Upload size={16} /> Importer des fichiers
-        </button>
+        </button>)}
       </div>
 
       {error && <p className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
@@ -159,20 +165,20 @@ const onConfirmReplace = async (rangs: number[]) => {
                     </div>
 
                     <div className="mt-3 flex flex-wrap gap-2">
-                      {publishable && (
+                      {canPublish && (
                         <button onClick={() => onPublish(f)} disabled={busy}
                           className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-700 disabled:opacity-60">
                           {busy && <Loader2 size={13} className="animate-spin" />} Publier
                         </button>
                       )}
-                      {f.statut === 'publie' && (
+                      {canPublish && (
                         <button onClick={() => onCancel(f)} disabled={busy}
                           className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold hover:bg-canvas disabled:opacity-60">
                           {busy ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />} 
                                 Annuler la publication
                         </button>
                       )}
-                      {f.statut !== 'publie' && (
+                      {canImport && (
                         <button onClick={() => onRemove(f)} disabled={busy}
                           className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60">
                           <Trash2 size={13} /> Supprimer
