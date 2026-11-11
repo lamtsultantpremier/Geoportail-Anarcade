@@ -1,3 +1,5 @@
+from .permissions import IsSuperAdmin, SuperAdminSeulement
+
 
 import json
 import os
@@ -47,7 +49,24 @@ from .models import (
     Denombrement, 
     PieceJustificatif,
     ParcelleInfo,
+    AuthUser,
+    Campagne, 
+    ModeFaireValoir, 
+    NiveauInstruction,
+    RoleDroit,
+    JournalActivite, 
+    Parametre,
+    AppVersion,
 )
+
+import re
+import subprocess
+from pathlib import Path
+from django.contrib.auth import authenticate
+from django.contrib.auth.models import Group, User
+from rest_framework.authtoken.models import Token
+from rest_framework.decorators import authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny, BasePermission
 
 from django.db.models import Func, TextField
 from django.shortcuts import get_object_or_404
@@ -85,6 +104,32 @@ from .models import ImportLot, ImportParcelle
 class AsGeoJSON(Func):
     function = "ST_AsGeoJSON"
     output_field = TextField()
+
+def droit_ecriture(nom):
+    """Lecture avec voir_donnees_validees ; écriture avec voir_donnees_validees ET `nom`."""
+    class P(BasePermission):
+        message = "Droit insuffisant."
+
+        def has_permission(self, request, view):
+            u = request.user
+            if not (u and u.is_authenticated and u.is_active):
+                return False
+            if not a_droit(u, "voir_donnees_validees"):
+                return False
+            return request.method in ("GET", "HEAD", "OPTIONS") or a_droit(u, nom)
+    return P
+
+
+def droit(nom):
+    """Classe de permission DRF : l'utilisateur connecté doit avoir ce droit."""
+    class Permission(BasePermission):
+        message = "Droit insuffisant."
+
+        def has_permission(self, request, view):
+            u = request.user
+            return bool(u and u.is_authenticated and u.is_active and a_droit(u, nom))
+    return Permission
+
 
 @api_view(['GET'])
 def district_avec_exploitants(request):
@@ -2180,7 +2225,7 @@ def _chevauche(geojson_txt, exclure_code=None):
                   AND ST_Area(ST_Intersection(p.geom_parc, t.g)::geography)
                       > %s * ST_Area(t.g::geography)
                 """,
-                [geojson_txt, exclure_code, exclure_code, CHEVAUCHEMENT_MAX],
+                [geojson_txt, exclure_code, exclure_code, float(param("chevauchement"))],
             )
             return cur.fetchone()[0]
     except Exception:
@@ -2250,7 +2295,7 @@ def _valider_lot(lot, items):
                     geojson = corrige
                     if not ok:
                         avert("Géométrie invalide à l'origine : réparée automatiquement.")
-                    if not (HA_MIN <= ha <= HA_MAX):
+                    if not (float(param("ha_min")) <= ha <= float(param("ha_max"))):
                         avert(f"Superficie inhabituelle ({ha:.2f} ha).")
                     if _chevauche(corrige, exclure_code=code if doublon else None):
                         avert("Chevauche une parcelle déjà enregistrée.")
@@ -2289,12 +2334,13 @@ def _resume_lot(lot):
 
 
 @api_view(["GET", "POST"])
+@permission_classes([droit_ecriture("importer")])  
 def imports_collection(request):
     if request.method == "GET":
         return Response([_resume_lot(l) for l in ImportLot.objects.all()[:50]])
 
-    if not _jeton_ok(request):
-        return Response({"detail": "Import non autorisé."}, status=403)
+    # if not _jeton_ok(request):
+    #     return Response({"detail": "Import non autorisé."}, status=403)
     items = request.data.get("items")
     if not isinstance(items, list) or not items:
         return Response({"detail": "Aucune parcelle à importer."}, status=400)
@@ -2311,11 +2357,12 @@ def imports_collection(request):
 
 
 @api_view(["GET", "DELETE"])
+@permission_classes([droit_ecriture("importer")])  
 def import_detail(request, id_lot):
     lot = get_object_or_404(ImportLot, pk=id_lot)
     if request.method == "DELETE":
-        if not _jeton_ok(request):
-            return Response({"detail": "Non autorisé."}, status=403)
+        # if not _jeton_ok(request):
+        #     return Response({"detail": "Non autorisé."}, status=403)
         if lot.statut == "publie":
             return Response({"detail": "Annulez d'abord la publication."}, status=409)
         lot.delete()
@@ -2324,6 +2371,7 @@ def import_detail(request, id_lot):
 
 
 @api_view(["GET"])
+@permission_classes([droit("voir_donnees_validees")])
 def import_geojson(request, id_lot):
     lot = get_object_or_404(ImportLot, pk=id_lot)
     features = []
@@ -2345,9 +2393,10 @@ def import_geojson(request, id_lot):
     return Response({"type": "FeatureCollection", "features": features})
 
 @api_view(["POST"])
+@permission_classes([droit_ecriture("publier")])
 def import_publier(request, id_lot):
-    if not _jeton_ok(request):
-        return Response({"detail": "Non autorisé."}, status=403)
+    # if not _jeton_ok(request):
+    #     return Response({"detail": "Non autorisé."}, status=403)
     lot = get_object_or_404(ImportLot, pk=id_lot)
     if lot.statut != "brouillon":
         return Response({"detail": "Ce lot n'est pas un brouillon."}, status=409)
@@ -2429,12 +2478,15 @@ def import_publier(request, id_lot):
         lot.statut = "publie"
         lot.publie_le = timezone.now()
         lot.save()
+        journaliser(request, "lot_publie", f"Lot #{lot.id}", lot.nom_fichier)
+
     return Response({**_resume_lot(lot), **bilan})
 
 @api_view(["POST"])
+@permission_classes([droit_ecriture("publier")])
 def import_annuler(request, id_lot):
-    if not _jeton_ok(request):
-        return Response({"detail": "Non autorisé."}, status=403)
+    # if not _jeton_ok(request):
+    #     return Response({"detail": "Non autorisé."}, status=403)
     lot = get_object_or_404(ImportLot, pk=id_lot)
     if lot.statut != "publie":
         return Response({"detail": "Ce lot n'est pas publié."}, status=409)
@@ -2473,6 +2525,7 @@ def import_annuler(request, id_lot):
     return Response(_resume_lot(lot))
 
 @api_view(["GET"])
+@permission_classes([droit("voir_donnees_validees")])
 def import_apercu(request, id_lot):
     """Doublons du lot, avec la parcelle existante à côté de la nouvelle (pour confirmation)."""
     lot = get_object_or_404(ImportLot, pk=id_lot)
@@ -2514,6 +2567,7 @@ def import_apercu(request, id_lot):
 
 CHEMIN_REGION_Q = "id_loc__id_s_pref__id_dept__id_reg"
 OUI = r"^(oui|yes|true|1)$"
+NON = r"^(non|no|false|0)$"
 
 COLONNES_DENOMB = [
     ("id", "ID"), ("uuid", "UUID"), ("num_questionnaire", "N° questionnaire"),
@@ -2657,14 +2711,16 @@ def stats_denombrements(request):
     r = denombrements_filtres(request.query_params).aggregate(
         fiches=Count("id_denomb"),
         avec_exploitant=Count("id_denomb", filter=Q(a_exploitant__iregex=OUI)),
+        sans_exploitant=Count("id_denomb", filter=Q(a_exploitant__iregex=NON)),
         validees=Count("id_denomb", filter=Q(statut__istartswith="valid")),
         exploitants=Sum(Case(
             When(nb_exploitant__regex=r"^[0-9]{1,3}$", then=Cast("nb_exploitant", IntegerField())),
             default=0, output_field=IntegerField(),
         )),
     )
+    sans_exploitant=r["fiches"]-r["avec_exploitant"]
     return Response({
-        "fiches": r["fiches"], "avec_exploitant": r["avec_exploitant"],
+        "fiches": r["fiches"], "avec_exploitant": r["avec_exploitant"],"sans_exploitant":r["sans_exploitant"],
         "validees": r["validees"], "exploitants": r["exploitants"] or 0,
     })
 
@@ -2864,18 +2920,33 @@ def liste_menages(request):
 def stats_menages(request):
     params = request.data if request.method == "POST" else request.query_params
     base = menages_filtres(params)
-
     total = base.count()
-    avec = base.filter(
-        exploitant__isnull=False          # si related_name par défaut
-    ).distinct().count()
+
+    #Exploitant réelement enregistré
+    exploitants = Exploitant.objects.filter(id_men__in=base.values("id_men"))
+    nb_exploitant = exploitants.count()
+    avec = exploitants.order_by().values("id_men").distinct().count()
+    # total = base.count()
+    avec_plusieurs_exploitant=(
+        exploitants
+        .values("id_men")
+        .annotate(nb=Count("id_expl"))
+        .filter(nb__gt=2)
+        .count()
+        )
+                    
+    # avec = base.filter(
+    #     exploitant__isnull=False          # si related_name par défaut
+    # ).distinct().count()
     # ou plus explicite :
     # avec = base.filter(id_men__in=Exploitant.objects.values("id_men")).count()
 
     return Response({
         "total": total,
-        "avec": avec,
+        "avec":total - avec_plusieurs_exploitant,
         "sans": total - avec,
+        "exploitants":nb_exploitant,
+        "avec_plusieurs":avec_plusieurs_exploitant
     })
 
 
@@ -3358,3 +3429,618 @@ def export_sig(request):
                   "denombrements": rubrique_denombrements}[rubrique]
     titres, lignes = construire(c)
     return _reponse_attributs(titres, lignes, fmt, base)
+
+
+
+
+    # ── Administration ─────────────────────────────────────────────────
+
+def _depuis(dt):
+    """'il y a 12 min' à partir d'une date."""
+    if not dt:
+        return None
+    s = max(int((timezone.now() - dt).total_seconds()), 0)
+    if s < 3600:
+        return f"il y a {max(s // 60, 1)} min"
+    if s < 86400:
+        return f"il y a {s // 3600} h"
+    return f"il y a {s // 86400} j"
+
+
+@api_view(["GET"])
+@permission_classes([droit("acces_admin")])
+def admin_tableau_bord(request):
+    parcelles = ParcelleCorrecte.objects
+    anomalies = (
+        avec_superficie(ParcelleCorrecte.objects).filter(superficie_ha__isnull=True).count()
+        + parcelles.filter(geom_parc__isnull=True).count()
+        + parcelles.filter(id_enqt__isnull=True).count()
+        + Exploitant.objects.filter(_vide("contacts")).count()
+    )
+
+    activite = []
+    for lot in ImportLot.objects.order_by("-cree_le")[:4]:
+        if lot.statut == "publie":
+            titre, genre = f"Import de {lot.nb_valides + lot.nb_avertissements} parcelles publié", "ok"
+        elif lot.statut == "annule":
+            titre, genre = "Publication annulée", "alerte"
+        else:
+            titre, genre = f"Import en brouillon : {lot.nom_fichier}", "import"
+        activite.append({"titre": titre, "detail": f"Lot #{lot.id} · {_depuis(lot.publie_le or lot.cree_le)}", "genre": genre})
+    if anomalies:
+        activite.append({"titre": f"{anomalies} anomalies détectées",
+                         "detail": "Superficie, contour, enquêteur ou contact manquants", "genre": "alerte"})
+
+    utilisateurs = []
+    for u in User.objects.prefetch_related("groups").order_by("-last_login", "-date_joined")[:6]:
+        utilisateurs.append({
+            "id": u.id, "nom": f"{u.first_name} {u.last_name}".strip() or u.username, "email": u.email,
+            "role": role_de(u), "actif": u.is_active,
+            "derniere_connexion": u.last_login.isoformat() if u.last_login else None})
+
+    return Response({
+        "compteurs": {
+            "exploitants": Exploitant.objects.count(),
+            "parcelles": parcelles.count(),
+            "menages": Menage.objects.count(),
+            "enquetes": Enquete.objects.count(),
+            "imports": ImportLot.objects.count(),
+            "utilisateurs": AuthUser.objects.count(),
+            "anomalies": anomalies,
+        },
+        "utilisateurs": utilisateurs,
+        "activite": activite,
+        "mis_a_jour": timezone.now().isoformat(),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([droit("acces_admin")])
+def admin_exploitants(request):
+    """Tableau « Tous les exploitants » : filtres district et statut, pagination."""
+    sans_contour = Count("parcellecorrecte", filter=Q(parcellecorrecte__geom_parc__isnull=True))
+    qs = (
+        Exploitant.objects
+        .select_related("id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg__id_dist")
+        .annotate(nb=Count("parcellecorrecte"), sans_contour=sans_contour)
+        .filter(nb__gt=0)
+    )
+    districts = liste_valeurs(request.query_params, "district_id")
+    if districts:
+        qs = qs.filter(id_men__id_quar__id_loc__id_s_pref__id_dept__id_reg__id_dist__in=districts)
+    statut = request.query_params.get("statut", "")
+    if statut == "valide":
+        qs = qs.filter(sans_contour=0)
+    elif statut == "erreur_gps":
+        qs = qs.filter(sans_contour__gt=0)
+    for mot in request.query_params.get("q", "").strip().split()[:5]:
+        qs = qs.filter(Q(nom_expl__icontains=mot) | Q(pren_expl__icontains=mot) | Q(code_expl__icontains=mot))
+
+    # superficie par exploitant en une requête
+    sup = dict(
+        avec_superficie(ParcelleCorrecte.objects).values("id_expl")
+        .annotate(s=Sum("superficie_ha")).values_list("id_expl", "s")
+    )
+    pagination = ExploitantPagination()
+    page = pagination.paginate_queryset(qs.order_by("code_expl"), request)
+    lignes = []
+    for e in page:
+        dist = _suivre(e.id_men, "id_quar", "id_loc", "id_s_pref", "id_dept", "id_reg", "id_dist")
+        lignes.append({
+            "id": e.id_expl, "code": e.code_expl, "nom": e.nom_expl, "prenom": e.pren_expl,
+            "contacts": e.contacts, "district": _suivre(dist, "lib_dist"),
+            "parcelles": e.nb, "superficie": round(float(sup.get(e.id_expl) or 0), 2),
+            "statut": "erreur_gps" if e.sans_contour else "valide",
+        })
+    return pagination.get_paginated_response(lignes)
+
+
+# ── Droits, rôles, journal ─────────────────────────────────────────
+PAGES = ["voir_denombrement", "voir_menage", "voir_carte", "voir_exploitants", "voir_statistique"]
+
+ROLES = ["Super-admin", "Admin", "Superviseur", "Enquêteur","Client"]
+
+DROITS = [
+    ("acces_admin", "Accéder au back-office"),
+    ("voir_donnees", "Consulter les données"),
+    ("exporter", "Exporter les données"),
+    ("importer", "Importer des fichiers"),
+    ("publier", "Publier ou annuler un lot"),
+    ("gerer_utilisateurs", "Gérer utilisateurs et rôles"),
+    ("gerer_referentiels", "Gérer les référentiels"),
+    ("voir_logs", "Consulter les logs"),
+    ("parametres", "Modifier les paramètres"),
+    ("sauvegardes", "Gérer les sauvegardes"),
+
+    #----------------DROITS DES CLIENTS ---------------------
+    ("voir_denombrement", "Voir le dénombrement"),
+    ("voir_menage", "Voir les ménages"),
+    ("voir_carte", "Voir la carte"),
+    ("voir_exploitants", "Voir les exploitants"),
+    ("voir_statistique", "Voir les statistiques"),
+    ("voir_donnees_validees", "Voir les données validées"),
+]
+
+CODES_DROITS = [c for c, _ in DROITS]
+
+DROITS_DEFAUT = {
+    "Admin": ["acces_admin", "voir_donnees", "exporter", "importer", "publier", "gerer_referentiels", "voir_logs",*PAGES,"voir_donnees_validees"],
+    "Superviseur": ["voir_donnees", "exporter", "importer",*PAGES],
+    "Enquêteur": ["voir_donnees",*PAGES],
+    "Client":["voir_donnees", *PAGES,"voir_donnees"],
+
+}
+
+
+def _semer_droits():
+    """Remplit les droits par défaut des rôles jamais semés (sans écraser ceux déjà réglés)."""
+    ligne = Parametre.objects.filter(cle="roles_semes").first()
+    deja = set(filter(None, (ligne.valeur if ligne else "").split(",")))
+    manquants = [r for r in DROITS_DEFAUT if r not in deja]
+    if not manquants:
+        return
+    for role in manquants:
+        if not RoleDroit.objects.filter(role=role).exists():
+            RoleDroit.objects.bulk_create([RoleDroit(role=role, droit=d) for d in DROITS_DEFAUT[role]])
+    Parametre.objects.update_or_create(
+        cle="roles_semes", defaults={"valeur": ",".join(sorted(deja | set(manquants)))})
+
+
+def role_de(u):
+    if u.is_superuser:
+        return "Super-admin"
+    noms = {g.name for g in u.groups.all()}
+    return next((r for r in ROLES[1:] if r in noms), "Utilisateur")
+
+
+def droits_de(u):
+    if u.is_superuser:
+        return CODES_DROITS
+    _semer_droits()
+    return list(RoleDroit.objects.filter(role=role_de(u)).values_list("droit", flat=True))
+
+
+def a_droit(u, droit):
+    return droit in droits_de(u)
+
+def droit_import(request, nom_action=None):
+    u = request.user
+    return bool(u and u.is_authenticated and u.is_active and a_droit(u, nom_action))
+
+
+
+# class DonneesValideesPermission(BasePermission):
+#     """Lecture : voir_donnees_validees. Import : importer. Publication / annulation : publier."""
+#     message = "Droit insuffisant."
+
+#     def has_permission(self, request, view):
+#         u = request.user
+#         if not (u and u.is_authenticated and u.is_active):
+#             return False
+#         requis = getattr(view, "cls", None)  # inutilisé : le droit est fixé par le décorateur ci-dessous
+#         return a_droit(u, "voir_donnees_validees")
+
+
+
+def journaliser(request, action, cible="", detail="", utilisateur=None):
+    u = getattr(request, "user", None)
+    nom = utilisateur if utilisateur is not None else (u.username if u and u.is_authenticated else "")
+    JournalActivite.objects.create(
+        utilisateur=nom, action=action, cible=str(cible)[:200], detail=detail,
+        ip=request.META.get("REMOTE_ADDR"))
+
+
+def _json_user(u):
+    return {
+        "id": u.id, "username": u.username, "prenom": u.first_name, "nom_famille": u.last_name,
+        "nom": f"{u.first_name} {u.last_name}".strip() or u.username, "email": u.email,
+        "role": role_de(u), "actif": u.is_active,
+        "derniere_connexion": u.last_login.isoformat() if u.last_login else None,
+    }
+
+
+def _poser_role(u, role):
+    u.groups.clear()
+    u.is_superuser = role == "Super-admin"
+    u.is_staff = role in ("Super-admin", "Admin")
+    u.save(update_fields=["is_superuser", "is_staff"])
+    if role in ROLES[1:]:
+        u.groups.add(Group.objects.get_or_create(name=role)[0])
+
+
+# ── Connexion ──
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def auth_login(request):
+    nom = str(request.data.get("username", "")).strip()
+    u = authenticate(username=nom, password=str(request.data.get("password", "")))
+    if not u or not u.is_active:
+        journaliser(request, "connexion_echec", nom, utilisateur=nom)
+        return Response({"detail": "Identifiant ou mot de passe incorrect."}, status=400)
+    token, _ = Token.objects.get_or_create(user=u)
+    u.last_login = timezone.now()
+    u.save(update_fields=["last_login"])
+    journaliser(request, "connexion", nom, utilisateur=nom)
+    return Response({"token": token.key, "user": {**_json_user(u), "droits": droits_de(u)}})
+
+
+@api_view(["GET"])
+@permission_classes([droit("voir_donnees")])
+def auth_me(request):
+    return Response({**_json_user(request.user), "droits": droits_de(request.user)})
+
+
+@api_view(["POST"])
+@permission_classes([droit("voir_donnees")])
+def auth_logout(request):
+    Token.objects.filter(user=request.user).delete()
+    journaliser(request, "deconnexion", request.user.username)
+    return Response(status=204)
+
+
+# ── Utilisateurs ──
+
+@api_view(["GET", "POST"])
+@permission_classes([droit("gerer_utilisateurs")])
+def admin_utilisateurs(request):
+    if request.method == "GET":
+        qs = User.objects.prefetch_related("groups").order_by("username")
+        for mot in request.query_params.get("q", "").strip().split()[:4]:
+            qs = qs.filter(Q(username__icontains=mot) | Q(first_name__icontains=mot)
+                           | Q(last_name__icontains=mot) | Q(email__icontains=mot))
+        pagination = ExploitantPagination()
+        page = pagination.paginate_queryset(qs, request)
+        return pagination.get_paginated_response([_json_user(u) for u in page])
+
+    d = request.data
+    username, mdp, role = str(d.get("username", "")).strip(), str(d.get("password", "")), d.get("role", "Enquêteur")
+    if not username:
+        return Response({"detail": "Identifiant obligatoire."}, status=400)
+    if len(mdp) < 8:
+        return Response({"detail": "Mot de passe : 8 caractères minimum."}, status=400)
+    if role not in ROLES:
+        return Response({"detail": "Rôle inconnu."}, status=400)
+    if role == "Super-admin" and not request.user.is_superuser:
+        return Response({"detail": "Seul un Super-admin peut créer un Super-admin."}, status=403)
+    if User.objects.filter(username__iexact=username).exists():
+        return Response({"detail": "Cet identifiant existe déjà."}, status=409)
+    u = User.objects.create_user(
+        username=username, password=mdp, email=str(d.get("email", "")).strip(),
+        first_name=str(d.get("prenom", "")).strip(), last_name=str(d.get("nom_famille", "")).strip())
+    _poser_role(u, role)
+    journaliser(request, "utilisateur_cree", username, f"Rôle : {role}")
+    return Response(_json_user(u), status=201)
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([droit("gerer_utilisateurs")])
+def admin_utilisateur(request, id_user):
+    u = get_object_or_404(User, pk=id_user)
+    moi = request.user
+    dernier_super = u.is_superuser and User.objects.filter(is_superuser=True, is_active=True).count() <= 1
+    if u.is_superuser and not moi.is_superuser:
+        return Response({"detail": "Seul un Super-admin peut modifier un Super-admin."}, status=403)
+
+    if request.method == "DELETE":
+        if u.pk == moi.pk:
+            return Response({"detail": "Vous ne pouvez pas supprimer votre propre compte."}, status=409)
+        if dernier_super:
+            return Response({"detail": "Impossible de supprimer le dernier Super-admin."}, status=409)
+        nom = u.username
+        u.delete()
+        journaliser(request, "utilisateur_supprime", nom)
+        return Response(status=204)
+
+    d = request.data
+    if "role" in d:
+        if d["role"] not in ROLES:
+            return Response({"detail": "Rôle inconnu."}, status=400)
+        if d["role"] == "Super-admin" and not moi.is_superuser:
+            return Response({"detail": "Seul un Super-admin peut attribuer ce rôle."}, status=403)
+        if d["role"] != role_de(u) and (u.pk == moi.pk or (dernier_super and d["role"] != "Super-admin")):
+            return Response({"detail": "Ce changement de rôle n'est pas autorisé pour ce compte."}, status=409)
+    if "actif" in d and not d["actif"] and (u.pk == moi.pk or dernier_super):
+        return Response({"detail": "Ce compte ne peut pas être suspendu."}, status=409)
+
+    for champ, attr in (("prenom", "first_name"), ("nom_famille", "last_name"), ("email", "email")):
+        if champ in d:
+            setattr(u, attr, str(d[champ]).strip())
+    if "actif" in d:
+        u.is_active = bool(d["actif"])
+    if d.get("password"):
+        if len(str(d["password"])) < 8:
+            return Response({"detail": "Mot de passe : 8 caractères minimum."}, status=400)
+        u.set_password(str(d["password"]))
+        Token.objects.filter(user=u).delete()          # déconnecte ses sessions
+    u.save()
+    if "role" in d:
+        _poser_role(u, d["role"])
+    journaliser(request, "utilisateur_modifie", u.username, ", ".join(k for k in d if k != "password"))
+    return Response(_json_user(u))
+
+
+# ── Rôles et permissions ──
+
+@api_view(["GET", "PUT"])
+@permission_classes([droit("gerer_utilisateurs")])
+def admin_roles(request):
+    _semer_droits()
+    if request.method == "PUT":
+        for role in ROLES[1:]:
+            if role in request.data:
+                valides = [x for x in request.data[role] if x in CODES_DROITS]
+                with transaction.atomic():
+                    RoleDroit.objects.filter(role=role).delete()
+                    RoleDroit.objects.bulk_create([RoleDroit(role=role, droit=x) for x in valides])
+        journaliser(request, "roles_modifies", "permissions")
+
+    par_groupe = dict(Group.objects.annotate(n=Count("user")).values_list("name", "n"))
+    par_groupe["Super-admin"] = User.objects.filter(is_superuser=True).count()
+    return Response({
+        "droits": [{"code": c, "label": l} for c, l in DROITS],
+        "roles": [{
+            "nom": r, "modifiable": r != "Super-admin", "utilisateurs": par_groupe.get(r, 0),
+            "droits": CODES_DROITS if r == "Super-admin"
+            else list(RoleDroit.objects.filter(role=r).values_list("droit", flat=True)),
+        } for r in ROLES],
+    })
+
+
+# ── Référentiels ──
+
+REFERENTIELS = {
+    "campagnes": (Campagne, "id_campag", "annee", "Campagnes"),
+    "milieux": (MilieuResidence, "id_milieu", "lib_mil", "Milieux de résidence"),
+    "modes": (ModeFaireValoir, "id_mode", "lib_mode", "Modes de faire-valoir"),
+    "niveaux": (NiveauInstruction, "id_niv", "lib_niv", "Niveaux d'instruction"),
+}
+
+
+def _utilise(obj):
+    return any(getattr(obj, r.get_accessor_name()).exists()
+               for r in obj._meta.related_objects if r.one_to_many)
+
+
+@api_view(["GET"])
+@permission_classes([droit("gerer_referentiels")])
+def admin_referentiels(request):
+    return Response([{"code": c, "label": lab, "total": m.objects.count()}
+                     for c, (m, _, _, lab) in REFERENTIELS.items()])
+
+
+@api_view(["GET", "POST"])
+@permission_classes([droit("gerer_referentiels")])
+def admin_referentiel(request, nom):
+    if nom not in REFERENTIELS:
+        return Response({"detail": "Référentiel inconnu."}, status=404)
+    modele, pk, champ, _ = REFERENTIELS[nom]
+    if request.method == "POST":
+        libelle = str(request.data.get("libelle", "")).strip()
+        if not libelle:
+            return Response({"detail": "Libellé obligatoire."}, status=400)
+        try:
+            obj = modele.objects.create(**{champ: libelle})
+        except IntegrityError:
+            return Response({"detail": "Cette valeur existe déjà."}, status=409)
+        journaliser(request, "referentiel_ajoute", nom, libelle)
+        return Response({"id": getattr(obj, pk), "libelle": libelle}, status=201)
+    return Response([{"id": i, "libelle": l}
+                     for i, l in modele.objects.order_by(champ).values_list(pk, champ)])
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([droit("gerer_referentiels")])
+def admin_referentiel_item(request, nom, id_item):
+    if nom not in REFERENTIELS:
+        return Response({"detail": "Référentiel inconnu."}, status=404)
+    modele, pk, champ, _ = REFERENTIELS[nom]
+    obj = get_object_or_404(modele, **{pk: id_item})
+    if request.method == "DELETE":
+        if _utilise(obj):
+            return Response({"detail": "Cette valeur est utilisée par des données : suppression refusée."}, status=409)
+        valeur = getattr(obj, champ)
+        obj.delete()
+        journaliser(request, "referentiel_supprime", nom, str(valeur))
+        return Response(status=204)
+    libelle = str(request.data.get("libelle", "")).strip()
+    if not libelle:
+        return Response({"detail": "Libellé obligatoire."}, status=400)
+    setattr(obj, champ, libelle)
+    try:
+        obj.save()
+    except IntegrityError:
+        return Response({"detail": "Cette valeur existe déjà."}, status=409)
+    journaliser(request, "referentiel_modifie", nom, libelle)
+    return Response({"id": id_item, "libelle": libelle})
+
+
+# ── Journal ──
+
+@api_view(["GET"])
+@permission_classes([droit("voir_logs")])
+def admin_logs(request):
+    qs = JournalActivite.objects.all()
+    for mot in request.query_params.get("q", "").strip().split()[:4]:
+        qs = qs.filter(Q(utilisateur__icontains=mot) | Q(cible__icontains=mot) | Q(detail__icontains=mot))
+    if request.query_params.get("action"):
+        qs = qs.filter(action=request.query_params["action"])
+    pagination = ExploitantPagination()
+    page = pagination.paginate_queryset(qs, request)
+
+    # Comptes concernés par cette page, en une seule requête
+    comptes = {u.username: u for u in
+               User.objects.filter(username__in={l.utilisateur for l in page}).prefetch_related("groups")}
+
+    resultats = []
+    for l in page:
+        u = comptes.get(l.utilisateur)
+        resultats.append({
+            "id": l.id, "date": l.date.isoformat(), "utilisateur": l.utilisateur,
+            "role": role_de(u) if u else None,
+            "prenom": u.first_name if u else None,
+            "nom_famille": u.last_name if u else None,
+            "action": l.action, "cible": l.cible, "detail": l.detail, "ip": l.ip,
+        })
+    rep = pagination.get_paginated_response(resultats)
+    rep.data["actions"] = list(JournalActivite.objects.order_by().values_list("action", flat=True).distinct())
+    return rep
+
+
+# ── Paramètres ──
+
+PARAMETRES = {
+    "organisation": ("Nom de l'organisation", "Géoportail Anacarde", "texte"),
+    "campagne": ("Campagne en cours", str(date.today().year), "texte"),
+    "ha_min": ("Superficie minimale plausible d'une parcelle (ha)", "0.01", "nombre"),
+    "ha_max": ("Superficie maximale plausible d'une parcelle (ha)", "500", "nombre"),
+    "chevauchement": ("Seuil de chevauchement signalé (0 à 1)", "0.5", "ratio"),
+}
+
+def param(cle):
+    ligne = Parametre.objects.filter(cle=cle).first()
+    return ligne.valeur if ligne and ligne.valeur != "" else PARAMETRES[cle][1]
+
+
+@api_view(["GET", "PUT"])
+@permission_classes([droit("parametres")])
+def admin_parametres(request):
+    if request.method == "PUT":
+        for cle, valeur in request.data.items():
+            if cle not in PARAMETRES:
+                continue
+            valeur = str(valeur).strip().replace(",", ".") if PARAMETRES[cle][2] != "texte" else str(valeur).strip()
+            if PARAMETRES[cle][2] != "texte":
+                try:
+                    n = float(valeur)
+                except ValueError:
+                    return Response({"detail": f"« {PARAMETRES[cle][0]} » doit être un nombre."}, status=400)
+                if n < 0 or (PARAMETRES[cle][2] == "ratio" and n > 1):
+                    return Response({"detail": f"Valeur hors limites : {PARAMETRES[cle][0]}."}, status=400)
+            Parametre.objects.update_or_create(cle=cle, defaults={"valeur": valeur})
+        journaliser(request, "parametres_modifies", "parametres", ", ".join(request.data.keys()))
+    return Response([{"cle": c, "label": l, "type": t, "valeur": param(c)} for c, (l, _, t) in PARAMETRES.items()])
+
+
+# ── Sauvegardes ──
+
+DOSSIER_SAUVEGARDES = Path(getattr(settings, "BACKUP_DIR", Path(settings.BASE_DIR) / "sauvegardes"))
+NOM_SAUVEGARDE = re.compile(r"^[\w.-]+\.dump$")
+
+
+@api_view(["GET", "POST"])
+@permission_classes([droit("sauvegardes")])
+def admin_sauvegardes(request):
+    DOSSIER_SAUVEGARDES.mkdir(parents=True, exist_ok=True)
+    if request.method == "POST":
+        bd = connection.settings_dict
+        nom = f"anacarde_{timezone.now():%Y%m%d_%H%M%S}.dump"
+        cmd = ["pg_dump", "-Fc", "-h", str(bd.get("HOST") or "localhost"), "-p", str(bd.get("PORT") or 5432),
+               "-U", bd["USER"], "-f", str(DOSSIER_SAUVEGARDES / nom), bd["NAME"]]
+        try:
+            r = subprocess.run(cmd, env={**os.environ, "PGPASSWORD": str(bd.get("PASSWORD") or "")},
+                               capture_output=True, text=True, timeout=1800)
+        except FileNotFoundError:
+            return Response({"detail": "pg_dump est introuvable sur le serveur (installe les outils client PostgreSQL)."}, status=501)
+        if r.returncode != 0:
+            (DOSSIER_SAUVEGARDES / nom).unlink(missing_ok=True)
+            return Response({"detail": f"Échec de pg_dump : {r.stderr.strip()[:300]}"}, status=500)
+        journaliser(request, "sauvegarde_creee", nom)
+    fichiers = sorted(DOSSIER_SAUVEGARDES.glob("*.dump"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return Response([{"nom": f.name, "taille": f.stat().st_size,
+                      "date": timezone.datetime.fromtimestamp(f.stat().st_mtime, timezone.get_current_timezone()).isoformat()}
+                     for f in fichiers])
+
+
+@api_view(["GET", "DELETE"])
+@permission_classes([droit("sauvegardes")])
+def admin_sauvegarde(request, nom):
+    chemin = DOSSIER_SAUVEGARDES / nom
+    if not NOM_SAUVEGARDE.match(nom) or not chemin.is_file():
+        return Response({"detail": "Sauvegarde introuvable."}, status=404)
+    if request.method == "DELETE":
+        chemin.unlink()
+        journaliser(request, "sauvegarde_supprimee", nom)
+        return Response(status=204)
+    journaliser(request, "sauvegarde_telechargee", nom)
+    return FileResponse(open(chemin, "rb"), as_attachment=True, filename=nom)
+
+
+# ── Versions de l'application ──────────────────────────────────────
+
+TYPES_VERSION = ("majeure", "mineure", "patch")
+ENVIRONNEMENTS = ("production", "preproduction", "developpement", "archivee")
+FORMAT_VERSION = re.compile(r"^v?\d+\.\d+\.\d+([-.][\w.]+)?$")
+
+
+def _json_version(v):
+    return {"id": v.id, "numero": v.numero, "type": v.type, "environnement": v.environnement,
+            "date": v.date_sortie.isoformat(), "notes": v.notes}
+
+
+def _lire_version(d, existant=None):
+    """Valide le corps de la requête. Renvoie (champs, erreur)."""
+    numero = str(d.get("numero", existant.numero if existant else "")).strip()
+    if not FORMAT_VERSION.match(numero):
+        return None, "Numéro invalide : attendu comme v2.4.2 (trois nombres séparés par des points)."
+    if not numero.startswith("v"):
+        numero = "v" + numero
+    type_ = d.get("type", existant.type if existant else "")
+    env = d.get("environnement", existant.environnement if existant else "")
+    if type_ not in TYPES_VERSION:
+        return None, "Type inconnu."
+    if env not in ENVIRONNEMENTS:
+        return None, "Environnement inconnu."
+    try:
+        jour = date.fromisoformat(str(d.get("date", existant.date_sortie.isoformat() if existant else "")))
+    except ValueError:
+        return None, "Date invalide."
+    doublon = AppVersion.objects.filter(numero__iexact=numero)
+    if existant:
+        doublon = doublon.exclude(pk=existant.pk)
+    if doublon.exists():
+        return None, f"La version {numero} existe déjà."
+    return {"numero": numero, "type": type_, "environnement": env, "date_sortie": jour,
+            "notes": str(d.get("notes", "")).strip()[:5000]}, None
+
+
+def _un_seul_en_production(version):
+    if version.environnement == "production":
+        AppVersion.objects.filter(environnement="production").exclude(pk=version.pk).update(environnement="archivee")
+
+
+@api_view(["GET", "POST"])
+@permission_classes([droit("parametres")])
+def admin_versions(request):
+    if request.method == "GET":
+        return Response([_json_version(v) for v in AppVersion.objects.all()])
+    champs, erreur = _lire_version(request.data)
+    if erreur:
+        return Response({"detail": erreur}, status=400)
+    with transaction.atomic():
+        v = AppVersion.objects.create(**champs)
+        _un_seul_en_production(v)
+    journaliser(request, "version_creee", v.numero, f"{v.type} · {v.environnement}")
+    return Response(_json_version(v), status=201)
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([droit("parametres")])
+def admin_version(request, id_version):
+    v = get_object_or_404(AppVersion, pk=id_version)
+    if request.method == "DELETE":
+        numero = v.numero
+        v.delete()
+        journaliser(request, "version_supprimee", numero)
+        return Response(status=204)
+    champs, erreur = _lire_version(request.data, v)
+    if erreur:
+        return Response({"detail": erreur}, status=400)
+    with transaction.atomic():
+        for k, val in champs.items():
+            setattr(v, k, val)
+        v.save()
+        _un_seul_en_production(v)
+    journaliser(request, "version_modifiee", v.numero)
+    return Response(_json_version(v))

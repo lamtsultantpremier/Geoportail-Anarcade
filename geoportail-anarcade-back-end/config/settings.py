@@ -21,7 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024
 
 # Protection provisoire des écritures d'import (voir l'avertissement plus bas)
-IMPORT_TOKEN = os.environ.get("IMPORT_TOKEN", "")
+# IMPORT_TOKEN = os.environ.get("IMPORT_TOKEN", "")
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
     'parcelles',
 ]
@@ -148,3 +149,9 @@ CORS_ALLOWED_ORIGINS=[
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+REST_FRAMEWORK = {
+    # fusionne avec ta configuration existante s'il y en a une
+    "DEFAULT_AUTHENTICATION_CLASSES": ["rest_framework.authentication.TokenAuthentication"],
+}
+BACKUP_DIR = BASE_DIR / "sauvegardes"      # dossier des sauvegardes

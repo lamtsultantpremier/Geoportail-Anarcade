@@ -390,6 +390,7 @@ class ParcelleCorrecte(models.Model):
     effectif_permanent = models.CharField(max_length=10, blank=True, null=True)
     salaire_main_oeuvre_permanent = models.CharField(max_length=255, blank=True, null=True)
     parcelle_zone_interdite = models.CharField(max_length=10, blank=True, null=True)
+    uuid_parcelle = models.CharField(max_length=255, blank=True, null=True)
 
     class Meta:
         managed = False
@@ -566,3 +567,45 @@ class ImportParcelle(models.Model):
     class Meta:
         db_table = "import_parcelle"
         ordering = ["rang"]
+
+# Administration models
+class RoleDroit(models.Model):
+    role = models.CharField(max_length=30)
+    droit = models.CharField(max_length=40)
+
+    class Meta:
+        db_table = "role_droit"
+        unique_together = (("role", "droit"),)
+
+
+class JournalActivite(models.Model):
+    date = models.DateTimeField(auto_now_add=True)
+    utilisateur = models.CharField(max_length=150, blank=True, default="")
+    action = models.CharField(max_length=40)
+    cible = models.CharField(max_length=200, blank=True, default="")
+    detail = models.TextField(blank=True, default="")
+    ip = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        db_table = "journal_activite"
+        ordering = ["-date"]
+
+
+class Parametre(models.Model):
+    cle = models.CharField(max_length=60, primary_key=True)
+    valeur = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "parametre"
+
+class AppVersion(models.Model):
+    numero = models.CharField(max_length=30, unique=True)
+    type = models.CharField(max_length=10)             # majeure | mineure | patch
+    environnement = models.CharField(max_length=15)    # production | preproduction | developpement | archivee
+    date_sortie = models.DateField()
+    notes = models.TextField(blank=True, default="")
+    cree_le = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "app_version"
+        ordering = ["-date_sortie", "-id"]

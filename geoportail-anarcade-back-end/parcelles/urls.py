@@ -41,13 +41,26 @@ from parcelles.views import (
     export_menages,
     sig_arbre,
     export_sig,
+    admin_tableau_bord,
+    admin_exploitants,
+    auth_login,
+    auth_me,
+    auth_logout,
+    admin_utilisateurs,
+    admin_utilisateur,
+    admin_roles,
+    admin_referentiels,
+    admin_referentiel,
+    admin_logs,
+    admin_referentiel_item,
+    admin_parametres,
+    admin_sauvegardes,
+    admin_sauvegarde,
+    admin_versions,
+    admin_version
+
+
     
-
-
-
-
-
-
     
 )
 """
@@ -148,4 +161,27 @@ urlpatterns = [
     # path('exploitants/<int:id>/',views.detail_exploitant,name="detail_exploitant")
     path("imports/<int:id_lot>/apercu/", import_apercu, name="import-apercu"),
     path("denombrements/geo/<str:niveau>/", options_geo_denombrements, name="denombrements-geo"),
+
+    #-----------------------Administration de l'application ----------------------------
+    path("admin-api/tableau-de-bord/", admin_tableau_bord, name="admin-tableau"),
+    path("admin-api/exploitants/", admin_exploitants, name="admin-exploitants"),
+
+
+    path("admin-api/auth/login/", auth_login, name="auth-login"),
+    path("admin-api/auth/me/", auth_me, name="auth-me"),
+    path("admin-api/auth/logout/", auth_logout, name="auth-logout"),
+    path("admin-api/utilisateurs/", admin_utilisateurs, name="admin-utilisateurs"),
+    path("admin-api/utilisateurs/<int:id_user>/", admin_utilisateur, name="admin-utilisateur"),
+    path("admin-api/roles/", admin_roles, name="admin-roles"),
+    path("admin-api/referentiels/", admin_referentiels, name="admin-referentiels"),
+    path("admin-api/referentiels/<str:nom>/", admin_referentiel, name="admin-referentiel"),
+    path("admin-api/referentiels/<str:nom>/<int:id_item>/", admin_referentiel_item, name="admin-referentiel-item"),
+    path("admin-api/logs/", admin_logs, name="admin-logs"),
+    path("admin-api/parametres/", admin_parametres, name="admin-parametres"),
+    path("admin-api/sauvegardes/", admin_sauvegardes, name="admin-sauvegardes"),
+    path("admin-api/sauvegardes/<str:nom>/", admin_sauvegarde, name="admin-sauvegarde"),
+
+    #----- Version de l'application -----------------------------------
+    path("admin-api/versions/", admin_versions, name="admin-versions"),
+    path("admin-api/versions/<int:id_version>/", admin_version, name="admin-version"),
 ]
