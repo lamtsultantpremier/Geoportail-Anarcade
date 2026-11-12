@@ -9,19 +9,19 @@ import clsx from 'clsx'
 import { useImports } from '../features/imports/importStore'
 import ImportModal from '../features/imports/ImportModal'
 import Sidebar from './Sidebar'
-import { useAuth,useIsSuperAdmin} from '../features/admin/auth'
+import { useAuth,useIsSuperAdmin,useCan} from '../features/admin/auth'
 import {capitalize} from '../lib/function'
 
 import { useEffect } from 'react'
 
 
 const nav = [
-  { to: '/denombrements', label: 'Dénombrements', icon: ClipboardList },
-  { to: '/menages', label: 'Ménages', icon: Home },
-  { to: '/', label: 'Carte', icon: MapIcon },
-  { to: '/exploitants', label: 'Exploitants', icon: Users },
-  { to: '/data', label: 'Statiques', icon: ChartSpline },
-  { to: '/data-sent', label: 'Données validées', icon: Database },
+  { to: '/denombrements', label: 'Dénombrements', icon: ClipboardList ,droit:"voir_denombrement"},
+  { to: '/menages', label: 'Ménages', icon: Home,droit:"voir_menage" },
+  { to: '/', label: 'Carte', icon: MapIcon ,droit:"voir_carte"},
+  { to: '/exploitants', label: 'Exploitants', icon: Users,droit:"voir_exploitants" },
+  { to: '/data', label: 'Statiques', icon: ChartSpline,droit:"voir_statistique" },
+  { to: '/data-sent', label: 'Données validées', icon: Database,droit:"voir_donnees_validees" },
 ]
 
 
@@ -62,21 +62,24 @@ export default function Layout() {
 
         {/* Menu horizontal (conservé) */}
         <nav className="flex gap-1">
-          {nav.map(({ to, label, icon: Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === '/'}
-              className={({ isActive }) =>
-                clsx(
-                  'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium',
-                  isActive ? 'bg-brand-50 text-brand-700' : 'text-muted hover:bg-canvas',
-                )
-              }
-            >
-              <Icon size={16} /> {label}
-            </NavLink>
-          ))}
+            {nav.map(({ to, label, icon: Icon, droit }) => {
+            const can = useCan(droit)          // ← même principe que canImport
+
+            if (!can) return null
+
+            return (
+                <NavLink
+                    key={to}
+                    to={to}
+                    end={to === '/'}
+                    className={({ isActive }) =>
+                    clsx(
+                        'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium',
+                        isActive ? 'bg-brand-50 text-brand-700' : 'text-muted hover:bg-canvas',
+                      )
+                    }>
+                  <Icon size={16} /> {label}
+                </NavLink>)})}
         </nav>
 
         <div className="ml-auto flex items-center gap-4">

@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import { NavLink } from 'react-router-dom'
 import {
   ChartSpline, CheckCheck, ClipboardList, Home, Map as MapIcon, Settings, Sprout, Users, X,
-  Crosshair,
+  Crosshair,CircleHelp
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -32,6 +32,7 @@ const MAIN: Item[] = [
   { to: '/data', label: 'Statiques', icon: ChartSpline, tone: 'orange' ,droit: 'voir_statistique'},
   { to: '/data-sent', label: 'Données validées', icon: CheckCheck, tone: 'green' ,droit: 'voir_donnees_validees'},
   { to: '/sig', label: 'SIG', icon: Crosshair, tone: 'red',droit: 'exporter' },
+  { to: '/aide', label: 'Aide', icon: CircleHelp, tone: 'blue', droit: 'voir_guide' },
 ]
 
 const ADMIN: Item = { to: '/administration', label: 'Administration', icon: Settings, tone: 'blue',droit: 'acces_admin' }

@@ -9,6 +9,7 @@ import DenombrementsPage from '../features/denombrements/DenombrementsPage'
 import MenagesPage from '../features/menages/MenagesPage'
 
 import SigPage from '../features/sig/SigPage'
+import AidePage from '../features/aide/AidePage'
 
 
 // Admin Layout
@@ -49,6 +50,7 @@ export const router=createBrowserRouter([
         { path: '/denombrements', element: <RequireRight droit="voir_denombrement"><DenombrementsPage /></RequireRight> },
         { path: '/menages', element: <RequireRight droit="voir_menage"><MenagesPage /></RequireRight>},
         { path: '/sig', element: <SigPage /> },
+        { path: '/aide', element: <RequireRight droit="voir_guide"><AidePage /></RequireRight> }
       // { path: '/administration', element: <AdminPage /> },
      ]   
    },
