@@ -3540,6 +3540,8 @@ PAGES = ["voir_denombrement", "voir_menage", "voir_carte", "voir_exploitants", "
 
 ROLES = ["Super-admin", "Admin", "Superviseur", "Enquêteur","Client"]
 
+DROITS_TOUS = ["voir_guide"] 
+
 DROITS = [
     ("acces_admin", "Accéder au back-office"),
     ("voir_donnees", "Consulter les données"),
@@ -3551,6 +3553,7 @@ DROITS = [
     ("voir_logs", "Consulter les logs"),
     ("parametres", "Modifier les paramètres"),
     ("sauvegardes", "Gérer les sauvegardes"),
+    ("voir_guide", "Voir le guide d'aide"),
 
     #----------------DROITS DES CLIENTS ---------------------
     ("voir_denombrement", "Voir le dénombrement"),
@@ -3564,10 +3567,10 @@ DROITS = [
 CODES_DROITS = [c for c, _ in DROITS]
 
 DROITS_DEFAUT = {
-    "Admin": ["acces_admin", "voir_donnees", "exporter", "importer", "publier", "gerer_referentiels", "voir_logs",*PAGES,"voir_donnees_validees"],
-    "Superviseur": ["voir_donnees", "exporter", "importer",*PAGES],
-    "Enquêteur": ["voir_donnees",*PAGES],
-    "Client":["voir_donnees", *PAGES,"voir_donnees"],
+    "Admin": ["acces_admin", "voir_donnees", "exporter", "importer", "publier", "gerer_referentiels", "voir_logs",*PAGES,"voir_donnees_validees","voir_guide"],
+    "Superviseur": ["voir_donnees", "exporter", "importer",*PAGES,"voir_guide"],
+    "Enquêteur": ["voir_donnees",*PAGES,"voir_guide"],
+    "Client":["voir_donnees", *PAGES,"voir_donnees","voir_guide"],
 
 }
 
@@ -3597,7 +3600,18 @@ def droits_de(u):
     if u.is_superuser:
         return CODES_DROITS
     _semer_droits()
-    return list(RoleDroit.objects.filter(role=role_de(u)).values_list("droit", flat=True))
+    role = role_de(u)
+    # Sans ligne pour ce droit dans la matrice, il est accordé : décocher l'enregistre explicitement
+    ligne = Parametre.objects.filter(cle="droits_tous_semes").first()
+    deja = set(filter(None, (ligne.valeur if ligne else "").split(",")))
+    for d in DROITS_TOUS:
+        if d not in deja:
+            for r in ROLES[1:]:
+                RoleDroit.objects.get_or_create(role=r, droit=d)
+            deja.add(d)
+            Parametre.objects.update_or_create(
+                cle="droits_tous_semes", defaults={"valeur": ",".join(sorted(deja))})
+    return list(RoleDroit.objects.filter(role=role).values_list("droit", flat=True))
 
 
 def a_droit(u, droit):
