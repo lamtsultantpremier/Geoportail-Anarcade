@@ -564,7 +564,9 @@ class ImportParcelle(models.Model):
     # A été ajouter
     id_parc_remplace = models.IntegerField(null=True, blank=True)   # id_parc existant remplacé
     ancienne_version = models.JSONField(null=True, blank=True)      # sauvegarde avant remplacement
+    uuid_parcelle = models.CharField(max_length=255, blank=True, null=True)
     class Meta:
+        managed = False
         db_table = "import_parcelle"
         ordering = ["rang"]
 
@@ -574,6 +576,7 @@ class RoleDroit(models.Model):
     droit = models.CharField(max_length=40)
 
     class Meta:
+        managed = False
         db_table = "role_droit"
         unique_together = (("role", "droit"),)
 
@@ -587,6 +590,7 @@ class JournalActivite(models.Model):
     ip = models.GenericIPAddressField(null=True, blank=True)
 
     class Meta:
+        managed = False
         db_table = "journal_activite"
         ordering = ["-date"]
 
@@ -596,6 +600,7 @@ class Parametre(models.Model):
     valeur = models.TextField(blank=True, default="")
 
     class Meta:
+        managed = False
         db_table = "parametre"
 
 class AppVersion(models.Model):
@@ -607,5 +612,163 @@ class AppVersion(models.Model):
     cree_le = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        managed = False
         db_table = "app_version"
         ordering = ["-date_sortie", "-id"]
+
+
+# ============================================================
+# MODULE IMPORT EXCEL + SYNCHRONISATION
+# ============================================================
+
+class ImportExcelLot(models.Model):
+    """Lot d'import d'un fichier Excel (3 classeurs)"""
+    STATUT_CHOICES = [
+        ("brouillon", "Brouillon"),
+        ("synchronise", "Synchronisé"),
+        ("publie", "Publié"),
+        ("annule", "Annulé"),
+    ]
+
+    nom_fichier = models.CharField(max_length=255)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default="brouillon")
+    cree_le = models.DateTimeField(auto_now_add=True)
+    synchronise_le = models.DateTimeField(null=True, blank=True)
+    publie_le = models.DateTimeField(null=True, blank=True)
+
+    # Statistiques
+    nb_parcelles = models.IntegerField(default=0)
+    nb_exploitants = models.IntegerField(default=0)
+    nb_denombrements = models.IntegerField(default=0)
+    nb_matches = models.IntegerField(default=0)
+    nb_erreurs = models.IntegerField(default=0)
+
+    class Meta:
+        managed = False
+        db_table = "import_excel_lot"
+        ordering = ["-cree_le"]
+
+    def __str__(self):
+        return f"ExcelLot #{self.id} - {self.nom_fichier} ({self.statut})"
+
+
+class StagingParcelleExcel(models.Model):
+    """Données du classeur 'parcelles'"""
+    lot = models.ForeignKey(ImportExcelLot, on_delete=models.CASCADE, related_name="parcelles")
+    
+    uuid = models.CharField(max_length=255, db_index=True)
+    code_exploitant = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    code_menage = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    
+    # Toutes les autres colonnes du classeur
+    donnees = models.JSONField(default=dict)
+    
+    statut = models.CharField(max_length=20, default="en_attente")  # en_attente | matche | ignore | erreur
+    messages = models.JSONField(default=list)
+
+    class Meta:
+        managed = False
+        db_table = "staging_parcelle_excel"
+        indexes = [
+            models.Index(fields=["lot", "uuid"]),
+            models.Index(fields=["code_exploitant"]),
+            models.Index(fields=["code_menage"]),
+        ]
+
+
+class StagingExploitantExcel(models.Model):
+    """Données du classeur 'exploitants'"""
+    lot = models.ForeignKey(ImportExcelLot, on_delete=models.CASCADE, related_name="exploitants")
+    
+    uuid = models.CharField(max_length=255, null=True, blank=True)
+    code_exploitant = models.CharField(max_length=100, db_index=True)
+    code_menage = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    
+    donnees = models.JSONField(default=dict)
+    statut = models.CharField(max_length=20, default="en_attente")
+
+    class Meta:
+        managed = False
+        db_table = "staging_exploitant_excel"
+        indexes = [
+            models.Index(fields=["lot", "code_exploitant"]),
+        ]
+
+
+class StagingDenombrementExcel(models.Model):
+    """Données du classeur 'denombrements'"""
+    lot = models.ForeignKey(ImportExcelLot, on_delete=models.CASCADE, related_name="denombrements")
+    
+    uuid = models.CharField(max_length=255, null=True, blank=True)
+    code_menage = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    num_questionnaire = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    
+    donnees = models.JSONField(default=dict)
+    statut = models.CharField(max_length=20, default="en_attente")
+
+    class Meta:
+        managed = False
+        db_table = "staging_denombrement_excel"
+        indexes = [
+            models.Index(fields=["lot", "code_menage"]),
+            models.Index(fields=["num_questionnaire"]),
+        ]
+
+
+class SynchronisationMatch(models.Model):
+    """
+    Table de matching entre :
+    - une parcelle SIG (ImportParcelle)
+    - les données Excel correspondantes
+    """
+    STATUT_CHOICES = [
+        ("matche", "Matché"),
+        ("non_matche_sig", "Parcelle SIG sans Excel"),
+        ("non_matche_excel", "Ligne Excel sans SIG"),
+        ("conflit", "Conflit (plusieurs correspondances)"),
+        ("existe_deja", "Parcelle déjà en base"),
+        ("a_remplacer", "À remplacer (confirmé)"),
+        ("ignore", "Ignoré par l'utilisateur"),
+        ("publie", "Publié"),
+        ("erreur", "Erreur"),
+    ]
+
+    # Liens vers les sources
+    lot_sig = models.ForeignKey("ImportLot", on_delete=models.CASCADE, related_name="matches")
+    lot_excel = models.ForeignKey(ImportExcelLot, on_delete=models.CASCADE, related_name="matches")
+    
+    import_parcelle = models.ForeignKey("ImportParcelle", on_delete=models.SET_NULL, null=True, blank=True)
+    staging_parcelle = models.ForeignKey(StagingParcelleExcel, on_delete=models.SET_NULL, null=True, blank=True)
+    staging_exploitant = models.ForeignKey(StagingExploitantExcel, on_delete=models.SET_NULL, null=True, blank=True)
+    staging_denombrement = models.ForeignKey(StagingDenombrementExcel, on_delete=models.SET_NULL, null=True, blank=True)
+
+    # Clés de matching
+    uuid = models.CharField(max_length=255, db_index=True)
+    code_parcelle = models.CharField(max_length=100, null=True, blank=True)
+    code_exploitant = models.CharField(max_length=100, null=True, blank=True)
+    code_menage = models.CharField(max_length=100, null=True, blank=True)
+
+    # Décision utilisateur
+    remplacer = models.BooleanField(default=False)          # Case cochée par l'utilisateur
+    existe_en_base = models.BooleanField(default=False)     # Déjà présent dans parcelle_correcte
+    id_parc_existant = models.IntegerField(null=True, blank=True)
+
+    # Résultat après publication
+    id_parc_publie = models.IntegerField(null=True, blank=True)
+    id_expl_publie = models.IntegerField(null=True, blank=True)
+    id_men_publie = models.IntegerField(null=True, blank=True)
+
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default="matche")
+    messages = models.JSONField(default=list)
+    
+    cree_le = models.DateTimeField(auto_now_add=True)
+    publie_le = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "synchronisation_match"
+        indexes = [
+            models.Index(fields=["lot_sig", "lot_excel"]),
+            models.Index(fields=["uuid"]),
+            models.Index(fields=["statut"]),
+        ]

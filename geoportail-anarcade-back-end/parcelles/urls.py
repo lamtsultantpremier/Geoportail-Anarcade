@@ -57,11 +57,12 @@ from parcelles.views import (
     admin_sauvegardes,
     admin_sauvegarde,
     admin_versions,
-    admin_version
-
-
-    
-    
+    admin_version,
+    imports_excel_collection,
+    import_excel_detail,
+    synchroniser,
+    synchroniser_matches,
+    synchroniser_publier,   
 )
 """
 URL configuration for config project.
@@ -184,4 +185,14 @@ urlpatterns = [
     #----- Version de l'application -----------------------------------
     path("admin-api/versions/", admin_versions, name="admin-versions"),
     path("admin-api/versions/<int:id_version>/", admin_version, name="admin-version"),
+
+    #------------------ IMPORT EXCEL DANS IMPORT DONNEE -----------------
+    path("imports-excel/", imports_excel_collection, name="imports-excel"),
+    path("imports-excel/<int:id_lot>/", import_excel_detail, name="import-excel-detail"),
+
+    #--------Synchronisation Excel et SIG --------------------------------
+
+    path("synchroniser/", synchroniser, name="synchroniser"),
+    path("synchroniser/<int:id_lot_excel>/matches/", synchroniser_matches, name="synchroniser-matches"),
+    path("synchroniser/publier/", synchroniser_publier, name="synchroniser-publier"),   
 ]

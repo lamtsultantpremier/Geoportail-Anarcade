@@ -1,6 +1,7 @@
 from .permissions import IsSuperAdmin, SuperAdminSeulement
-
-
+from datetime import datetime
+import pandas as pd
+from rest_framework import status
 import json
 import os
 from django.http import FileResponse
@@ -57,6 +58,11 @@ from .models import (
     JournalActivite, 
     Parametre,
     AppVersion,
+    ImportLot, ImportParcelle,
+    ImportExcelLot, StagingParcelleExcel,
+    StagingExploitantExcel, StagingDenombrementExcel,
+    SynchronisationMatch,
+    Enqueteur
 )
 
 import re
@@ -95,9 +101,11 @@ from xml.sax.saxutils import escape as xml_escape
 import shapefile  # pyshp
 
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, transaction,connection
 from django.utils import timezone
 from .models import ImportLot, ImportParcelle
+from collections import defaultdict
+
 
 
 
@@ -2281,7 +2289,8 @@ def _valider_lot(lot, items):
 
         id_expl = expl.get(_code_exploitant(code, props)) if code else None
         if code and id_expl is None:
-            erreur("Exploitant introuvable pour ce code.")
+            # Plus bloquant : l'exploitant sera créé à la publication Excel
+            avert("Exploitant absent en base pour ce code (sera résolu via Excel).")
 
         geojson, ha = "", None
         if not isinstance(geom, dict) or geom.get("type") not in ("Polygon", "MultiPolygon"):
@@ -2309,7 +2318,7 @@ def _valider_lot(lot, items):
         
         lignes.append(ImportParcelle(
             lot=lot, rang=i, code=code, geojson=geojson or json.dumps(geom or {}),
-            proprietes=props, statut=statut, messages=msgs, id_expl=id_expl,
+            proprietes=props, statut=statut, messages=msgs, id_expl=id_expl,uuid_parcelle=_extraire_uuid(props),
             superficie_ha=ha if geojson else None,
         ))
 
@@ -2321,6 +2330,19 @@ def _valider_lot(lot, items):
     lot.nb_doublons = compte["doublon"]
     lot.save()
 
+
+def _extraire_uuid(props: dict):
+    if not isinstance(props, dict):
+        return None
+    for k in ("uuid", "UUID", "Uuid", "uuid_parcelle", "UUID_PARCELLE"):
+        v = props.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    # secours : clé contenant "uuid"
+    for k, v in props.items():
+        if "uuid" in str(k).lower() and v is not None and str(v).strip():
+            return str(v).strip()
+    return None
 
 def _resume_lot(lot):
     return {
@@ -2337,7 +2359,7 @@ def _resume_lot(lot):
 @permission_classes([droit_ecriture("importer")])  
 def imports_collection(request):
     if request.method == "GET":
-        return Response([_resume_lot(l) for l in ImportLot.objects.all()[:50]])
+        return Response([_resume_lot(l) for l in ImportLot.objects.order_by("-cree_le")[:50]])
 
     # if not _jeton_ok(request):
     #     return Response({"detail": "Import non autorisé."}, status=403)
@@ -2353,6 +2375,14 @@ def imports_collection(request):
             format=str(request.data.get("format", ""))[:20],
         )
         _valider_lot(lot, items)
+
+        # Journalisation
+        journaliser(
+            request,
+            action="import_sig",
+            cible=f"Lot SIG #{lot.id}",
+            detail=f"Fichier « {lot.nom_fichier} » ({lot.format}) – {lot.nb_total} parcelle(s)",
+        )
     return Response(_resume_lot(lot), status=201)
 
 
@@ -2366,6 +2396,7 @@ def import_detail(request, id_lot):
         if lot.statut == "publie":
             return Response({"detail": "Annulez d'abord la publication."}, status=409)
         lot.delete()
+        journaliser(request, "suppression_sig", f"Lot SIG #{lot.id}", lot.nom_fichier)
         return Response(status=204)
     return Response(_resume_lot(lot))
 
@@ -4058,3 +4089,1229 @@ def admin_version(request, id_version):
         _un_seul_en_production(v)
     journaliser(request, "version_modifiee", v.numero)
     return Response(_json_version(v))
+
+
+#------------------Fonction pour nettoyer le fichier Excel.
+
+def _nettoyer_valeur(val):
+    """Convertit les valeurs pandas (NaN, NaT...) en None ou str propre."""
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        return val
+    return str(val).strip() or None
+
+
+def _lire_classeurs(fichier):
+    """
+    Lit les 3 classeurs du fichier Excel.
+    Retourne un dict avec les DataFrames.
+    """
+    try:
+        xls = pd.ExcelFile(fichier)
+    except Exception as e:
+        raise ValueError(f"Impossible de lire le fichier Excel : {e}")
+
+    classeurs_attendus = ["parcelles", "exploitants", "denombrements"]
+    feuilles = {nom.lower(): nom for nom in xls.sheet_names}
+
+    manquants = [c for c in classeurs_attendus if c not in feuilles]
+    if manquants:
+        raise ValueError(
+            f"Classeur(s) manquant(s) : {', '.join(manquants)}. "
+            f"Feuilles trouvées : {list(xls.sheet_names)}"
+        )
+
+    return {
+        "parcelles": pd.read_excel(xls, sheet_name=feuilles["parcelles"], dtype=str),
+        "exploitants": pd.read_excel(xls, sheet_name=feuilles["exploitants"], dtype=str),
+        "denombrements": pd.read_excel(xls, sheet_name=feuilles["denombrements"], dtype=str),
+    }
+
+
+def _extraire_cles_parcelle(row):
+    """Récupère uuid, code_exploitant et code_menage depuis une ligne du classeur parcelles."""
+    # On tolère plusieurs orthographes possibles de colonnes
+    uuid = (
+        row.get("UUID")
+        or row.get("uuid")
+        or row.get("Uuid")
+    )
+    code_expl = (
+        row.get("Code exploitant")
+        or row.get("code exploitant")
+        or row.get("Code_Exploitant")
+        or row.get("code_exploitant")
+    )
+    code_men = (
+        row.get("Code menage")
+        or row.get("code menage")
+        or row.get("Code_Menage")
+        or row.get("code_menage")
+    )
+    return _nettoyer_valeur(uuid), _nettoyer_valeur(code_expl), _nettoyer_valeur(code_men)
+
+
+@api_view(["GET", "POST"])
+def imports_excel_collection(request):
+    if request.method == "GET":
+        lots = ImportExcelLot.objects.order_by("-cree_le")[:50]
+        return Response([
+            {
+                "id": lot.id,
+                "fichier": lot.nom_fichier,
+                "statut": lot.statut,
+                "cree_le": lot.cree_le.isoformat(),
+                "nb_parcelles": lot.nb_parcelles,
+                "nb_exploitants": lot.nb_exploitants,
+                "nb_denombrements": lot.nb_denombrements,
+                "nb_matches": lot.nb_matches,
+                "nb_erreurs": lot.nb_erreurs,
+            }
+            for lot in lots
+        ])
+
+    # ---------- POST : Import du fichier Excel ----------
+    fichier = request.FILES.get("fichier")
+    if not fichier:
+        return Response({"detail": "Aucun fichier envoyé."}, status=400)
+
+    if not fichier.name.lower().endswith((".xlsx", ".xls")):
+        return Response({"detail": "Le fichier doit être au format Excel (.xlsx ou .xls)."}, status=400)
+
+    try:
+        classeurs = _lire_classeurs(fichier)
+    except ValueError as e:
+        return Response({"detail": str(e)}, status=400)
+
+    df_parcelles = classeurs["parcelles"]
+    df_exploitants = classeurs["exploitants"]
+    df_denombrements = classeurs["denombrements"]
+
+    with transaction.atomic():
+        lot = ImportExcelLot.objects.create(
+            nom_fichier=fichier.name[:255],
+            statut="brouillon",
+        )
+
+        # ----- Parcelles -----
+        parcelles_obj = []
+        erreurs_parcelles = 0
+        for idx, row in df_parcelles.iterrows():
+            data = {str(k): _nettoyer_valeur(v) for k, v in row.items()}
+            uuid, code_expl, code_men = _extraire_cles_parcelle(data)
+
+            msgs = []
+            if not uuid:
+                msgs.append({"niveau": "erreur", "texte": "UUID manquant"})
+                erreurs_parcelles += 1
+
+            parcelles_obj.append(
+                StagingParcelleExcel(
+                    lot=lot,
+                    uuid=uuid or f"SANS_UUID_{idx}",
+                    code_exploitant=code_expl,
+                    code_menage=code_men,
+                    donnees=data,
+                    statut="erreur" if msgs else "en_attente",
+                    messages=msgs,
+                )
+            )
+
+        StagingParcelleExcel.objects.bulk_create(parcelles_obj, batch_size=500)
+
+        # ----- Exploitants -----
+        exploitants_obj = []
+        for idx, row in df_exploitants.iterrows():
+            data = {str(k): _nettoyer_valeur(v) for k, v in row.items()}
+            code_expl = (
+                data.get("Code exploitant")
+                or data.get("code exploitant")
+                or data.get("Code_Exploitant")
+                or data.get("code_exploitant")
+            )
+            code_men = (
+                data.get("Code menage")
+                or data.get("code menage")
+                or data.get("Code_Menage")
+                or data.get("code_menage")
+            )
+            uuid = data.get("UUID") or data.get("uuid")
+
+            exploitants_obj.append(
+                StagingExploitantExcel(
+                    lot=lot,
+                    uuid=_nettoyer_valeur(uuid),
+                    code_exploitant=_nettoyer_valeur(code_expl) or f"SANS_CODE_{idx}",
+                    code_menage=_nettoyer_valeur(code_men),
+                    donnees=data,
+                )
+            )
+
+        StagingExploitantExcel.objects.bulk_create(exploitants_obj, batch_size=500)
+
+        # ----- Dénombrements -----
+        denombrements_obj = []
+        for idx, row in df_denombrements.iterrows():
+            data = {str(k): _nettoyer_valeur(v) for k, v in row.items()}
+            code_men = (
+                data.get("Code menage")
+                or data.get("code menage")
+                or data.get("Code_Menage")
+                or data.get("code_menage")
+                or data.get("Q.15 Numero du menage")  # secours possible
+            )
+            num_quest = (
+                data.get("Q.2 Numero du questionnaire")
+                or data.get("Numero du questionnaire")
+                or data.get("num_questionnaire")
+            )
+            uuid = data.get("UUID") or data.get("uuid")
+
+            denombrements_obj.append(
+                StagingDenombrementExcel(
+                    lot=lot,
+                    uuid=_nettoyer_valeur(uuid),
+                    code_menage=_nettoyer_valeur(code_men),
+                    num_questionnaire=_nettoyer_valeur(num_quest),
+                    donnees=data,
+                )
+            )
+
+        StagingDenombrementExcel.objects.bulk_create(denombrements_obj, batch_size=500)
+
+        # Mise à jour des compteurs
+        lot.nb_parcelles = len(parcelles_obj)
+        lot.nb_exploitants = len(exploitants_obj)
+        lot.nb_denombrements = len(denombrements_obj)
+        lot.nb_erreurs = erreurs_parcelles
+        lot.save()
+    
+
+    # Journalisation
+    journaliser(
+        request,
+        action="import_excel",
+        cible=f"Lot Excel #{lot.id}",
+        detail=(
+            f"Fichier « {lot.nom_fichier} » – "
+            f"{lot.nb_parcelles} parcelles, "
+            f"{lot.nb_exploitants} exploitants, "
+            f"{lot.nb_denombrements} dénombrements"),)
+    return Response(
+        {
+            "id": lot.id,
+            "fichier": lot.nom_fichier,
+            "statut": lot.statut,
+            "nb_parcelles": lot.nb_parcelles,
+            "nb_exploitants": lot.nb_exploitants,
+            "nb_denombrements": lot.nb_denombrements,
+            "nb_erreurs": lot.nb_erreurs,
+            "message": "Fichier Excel importé avec succès dans le staging.",
+        },
+        status=201,
+    )
+
+
+@api_view(["GET", "DELETE"])
+def import_excel_detail(request, id_lot):
+    lot = get_object_or_404(ImportExcelLot, pk=id_lot)
+
+    if request.method == "DELETE":
+        if lot.statut == "publie":
+            return Response(
+                {"detail": "Impossible de supprimer un lot déjà publié."},
+                status=409,
+            )
+        lot.delete()
+        journaliser(request, "suppression_excel", f"Lot Excel #{lot.id}", lot.nom_fichier)
+        return Response(status=204)
+
+    # GET
+    return Response({
+        "id": lot.id,
+        "fichier": lot.nom_fichier,
+        "statut": lot.statut,
+        "cree_le": lot.cree_le.isoformat(),
+        "synchronise_le": lot.synchronise_le.isoformat() if lot.synchronise_le else None,
+        "publie_le": lot.publie_le.isoformat() if lot.publie_le else None,
+        "nb_parcelles": lot.nb_parcelles,
+        "nb_exploitants": lot.nb_exploitants,
+        "nb_denombrements": lot.nb_denombrements,
+        "nb_matches": lot.nb_matches,
+        "nb_erreurs": lot.nb_erreurs,
+    })
+
+
+
+@api_view(["POST"])
+def synchroniser(request):
+    id_lot_sig = request.data.get("id_lot_sig")
+    id_lot_excel = request.data.get("id_lot_excel")
+
+    if not id_lot_sig or not id_lot_excel:
+        return Response(
+            {"detail": "id_lot_sig et id_lot_excel sont obligatoires."},
+            status=400,
+        )
+
+    try:
+        lot_sig = ImportLot.objects.get(pk=id_lot_sig)
+        lot_excel = ImportExcelLot.objects.get(pk=id_lot_excel)
+    except (ImportLot.DoesNotExist, ImportExcelLot.DoesNotExist):
+        return Response({"detail": "Lot SIG ou Excel introuvable."}, status=404)
+
+    # On ne resynchronise pas un lot Excel déjà publié
+    if lot_excel.statut == "publie":
+        return Response(
+            {"detail": "Ce lot Excel a déjà été publié."},
+            status=409,
+        )
+
+    with transaction.atomic():
+        # Nettoyage des anciens matches de ces deux lots
+        SynchronisationMatch.objects.filter(
+            lot_sig=lot_sig,
+            lot_excel=lot_excel,
+        ).delete()
+
+        # Index des parcelles Excel par UUID
+        staging_parcelles = {
+            sp.uuid: sp
+            for sp in StagingParcelleExcel.objects.filter(lot=lot_excel)
+            if sp.uuid
+        }
+
+        # Index des exploitants par code_exploitant
+        staging_exploitants = defaultdict(list)
+        for se in StagingExploitantExcel.objects.filter(lot=lot_excel):
+            if se.code_exploitant:
+                staging_exploitants[se.code_exploitant].append(se)
+
+        # Index des dénombrements par code_menage
+        staging_denombrements = defaultdict(list)
+        for sd in StagingDenombrementExcel.objects.filter(lot=lot_excel):
+            if sd.code_menage:
+                staging_denombrements[sd.code_menage].append(sd)
+
+        matches_crees = []
+        rows_preview = []
+
+        # On parcourt les parcelles SIG valides
+        parcelles_sig = ImportParcelle.objects.filter(
+            lot=lot_sig
+        ).exclude(statut="erreur")
+
+        for p in parcelles_sig:
+            uuid = (p.uuid_parcelle or "").strip()
+            props = p.proprietes or {}
+
+            # Données SIG pour le preview
+            name = props.get("name") or props.get("nom") or None
+            code = p.code
+            superficie = float(p.superficie_ha) if p.superficie_ha is not None else None
+            observatio = props.get("observatio") or props.get("observation") or props.get("obs") or None
+
+            staging_p = staging_parcelles.get(uuid) if uuid else None
+
+            if not staging_p:
+                # Pas de correspondance Excel
+                match = SynchronisationMatch.objects.create(
+                    lot_sig=lot_sig,
+                    lot_excel=lot_excel,
+                    import_parcelle=p,
+                    uuid=uuid or "",
+                    code_parcelle=code,
+                    statut="non_matche_sig",
+                    messages=[{"niveau": "avertissement", "texte": "Aucune parcelle Excel trouvée pour cet UUID."}],
+                )
+                matches_crees.append(match)
+                continue
+
+            code_expl = staging_p.code_exploitant
+            code_men = staging_p.code_menage
+
+            # Recherche exploitant
+            expl_list = staging_exploitants.get(code_expl, []) if code_expl else []
+            staging_e = expl_list[0] if len(expl_list) == 1 else None
+
+            # Recherche dénombrement
+            den_list = staging_denombrements.get(code_men, []) if code_men else []
+            staging_d = den_list[0] if len(den_list) == 1 else None
+
+            messages = []
+            statut = "matche"
+
+            if not code_expl:
+                messages.append({"niveau": "avertissement", "texte": "Code exploitant manquant dans Excel."})
+            elif not staging_e:
+                messages.append({"niveau": "avertissement", "texte": "Exploitant introuvable pour ce code."})
+                statut = "conflit"
+
+            if len(expl_list) > 1:
+                messages.append({"niveau": "avertissement", "texte": "Plusieurs exploitants pour le même code."})
+                statut = "conflit"
+
+            match = SynchronisationMatch.objects.create(
+                lot_sig=lot_sig,
+                lot_excel=lot_excel,
+                import_parcelle=p,
+                staging_parcelle=staging_p,
+                staging_exploitant=staging_e,
+                staging_denombrement=staging_d,
+                uuid=uuid,
+                code_parcelle=code,
+                code_exploitant=code_expl,
+                code_menage=code_men,
+                statut=statut,
+                messages=messages,
+            )
+            matches_crees.append(match)
+
+            # Ligne pour le tableau de prévisualisation
+            rows_preview.append({
+                "name": name,
+                "code": code,
+                "superficie": superficie,
+                "observatio": observatio,
+                "code_exploitant": code_expl,
+                "code_menage": code_men,
+                "statut": statut,
+            })
+
+        # Mise à jour du lot Excel
+        lot_excel.statut = "synchronise"
+        lot_excel.synchronise_le = timezone.now()
+        lot_excel.nb_matches = len([m for m in matches_crees if m.statut == "matche"])
+        lot_excel.save()
+
+        # Journalisation
+        journaliser(
+            request,
+            action="synchronisation",
+            cible=f"SIG#{lot_sig.id} + Excel#{lot_excel.id}",
+            detail=f"{len(rows_preview)} correspondances trouvées sur {parcelles_sig.count()} parcelles SIG",
+        )
+
+    return Response({
+        "lot_sig": lot_sig.id,
+        "lot_excel": lot_excel.id,
+        "total_matches": len(rows_preview),
+        "rows": rows_preview,
+    })
+
+@api_view(["GET"])
+def synchroniser_matches(request, id_lot_excel):
+    lot_excel = get_object_or_404(ImportExcelLot, pk=id_lot_excel)
+
+    matches = (
+        SynchronisationMatch.objects
+        .filter(lot_excel=lot_excel)
+        .select_related("import_parcelle", "staging_parcelle")
+        .order_by("id")
+    )
+
+    rows = []
+    for m in matches:
+        # On n’affiche que les lignes réellement matchées (ou selon ton besoin)
+        if m.statut not in ("matche", "a_remplacer", "conflit"):
+            continue
+
+        props = (m.import_parcelle.proprietes if m.import_parcelle else {}) or {}
+        name = props.get("name") or props.get("nom")
+        superficie = (
+            float(m.import_parcelle.superficie_ha)
+            if m.import_parcelle and m.import_parcelle.superficie_ha is not None
+            else None
+        )
+        observatio = (
+            props.get("observatio")
+            or props.get("observation")
+            or props.get("obs")
+        )
+
+        rows.append({
+            "name": name,
+            "code": m.code_parcelle,
+            "superficie": superficie,
+            "observatio": observatio,
+            "code_exploitant": m.code_exploitant,
+            "code_menage": m.code_menage,
+            "statut": m.statut,
+        })
+
+    return Response({
+        "lot_excel": lot_excel.id,
+        "total_matches": len(rows),
+        "rows": rows,
+    })
+
+
+def _val(donnees: dict, *cles):
+    """Récupère la première valeur non vide parmi plusieurs noms de colonnes possibles."""
+    for c in cles:
+        v = donnees.get(c)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return None
+
+
+def peupler_menages_depuis_excel(lot_excel: ImportExcelLot) -> dict:
+    """
+    Crée / met à jour les ménages à partir des classeurs
+    denombrements + exploitants du lot Excel.
+    Retourne un petit bilan.
+    """
+    denombrements = list(
+        StagingDenombrementExcel.objects.filter(lot=lot_excel)
+    )
+    exploitants = list(
+        StagingExploitantExcel.objects.filter(lot=lot_excel)
+    )
+
+    # Index exploitants par code / numéro de ménage
+    expl_par_menage = {}
+    for ex in exploitants:
+        data = ex.donnees or {}
+        code_men = (
+            ex.code_menage
+            or _val(data, "Q.14 Numero du menage", "Code menage", "code_menage")
+        )
+        if code_men and code_men not in expl_par_menage:
+            expl_par_menage[code_men] = data
+
+    # Index quartiers par libellé (déjà en base)
+    quartiers = {
+        (q.lib_quar or "").strip().lower(): q
+        for q in Quartier.objects.all()
+        if q.lib_quar
+    }
+
+    crees, maj, ignores, sans_quartier = 0, 0, 0, 0
+    vus = set()  # équivalent DISTINCT ON (code_men)
+
+    with transaction.atomic():
+        for den in denombrements:
+            d = den.donnees or {}
+
+            code_men = (
+                den.code_menage
+                or _val(d, "Q.15 Numero du menage", "Code menage", "code_menage")
+            )
+            if not code_men or code_men in vus:
+                ignores += 1
+                continue
+            vus.add(code_men)
+
+            # Quartier
+            lib_quar = _val(d, "Q.13 Quartier/Campement", "Quartier/Campement", "quartier")
+            quartier = quartiers.get((lib_quar or "").lower()) if lib_quar else None
+            if not quartier:
+                sans_quartier += 1
+                # On peut choisir d'ignorer le ménage ou de l'insérer sans id_quar
+                # Ici on ignore pour rester fidèle à ton INNER JOIN
+                continue
+
+            ex = expl_par_menage.get(code_men, {})
+
+            defaults = {
+                "nom_chef": _val(d, "Q.17 Nom du chef de menage"),
+                "pren_chef": _val(d, "Q.18 Prenom du chef de menage"),
+                "cont_chef": _val(d, "Q.19 Contact du chef de menage"),
+                "nb_enfant": _val(ex, "Q.53 Nb enfants"),
+                "nb_femme": _val(ex, "Q.56 Nb femmes dans le menage"),
+                "id_quar": quartier,
+                "nb_personne_en_charge": _val(ex, "Q.55 Nb personnes a charge"),
+                "nb_personne_menage": _val(ex, "Q.52 Nb personnes du menage"),
+                "nb_enfant_scolarise": _val(ex, "Q.54 Nb enfants scolarises"),
+                "type_batiment": _val(ex, "Q.57 Types de batiment"),
+                "materiaux_principal_murs": _val(ex, "Q.58 Materiau principal des murs"),
+                "materiaux_principal_toit": _val(ex, "Q.59 Materiau principal du toit"),
+                "type_sanitaire": _val(ex, "Q.60 Type de sanitaire"),
+                "source_combustible": _val(ex, "Q.61 Source de combustible"),
+                "source_eclairage": _val(ex, "Q.62 Source d'eclairage"),
+                "source_eau": _val(ex, "Q.63 Source d'eau"),
+                "nb_exploitant": _val(d, "Q.20 Nombre d'exploitants d'anacarde"),
+                "a_exploitant_anarcade": _val(
+                    d, "Q.16 Y a-t-il des exploitants d'anacarde dans le menage ?"
+                ),
+                "distance_infr_sante": _val(ex, "Q.73 Distance sante (km)"),
+                "distance_etabl_scol": _val(ex, "Q.77 Distances aux etablissements"),
+            }
+
+            obj, created = Menage.objects.update_or_create(
+                code_men=code_men,
+                defaults=defaults,
+            )
+            if created:
+                crees += 1
+            else:
+                maj += 1
+
+    return {
+        "crees": crees,
+        "mis_a_jour": maj,
+        "ignores": ignores,
+        "sans_quartier": sans_quartier,
+        "total_uniques": len(vus),
+    }
+
+# Peupler la table exploitant
+def _val(donnees: dict, *cles):
+    """Première valeur non vide parmi plusieurs noms de colonnes possibles."""
+    for c in cles:
+        v = donnees.get(c)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return None
+
+
+def _parse_date(val):
+    """Convertit une date texte en date Python, ou None."""
+    if not val:
+        return None
+    val = str(val).strip()
+    if not val:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(val, fmt).date()
+        except ValueError:
+            continue
+    return 
+
+def _parse_int(val):
+    if val is None:
+        return None
+    try:
+        return int(float(str(val).replace(",", ".").strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def peupler_exploitants_depuis_excel(lot_excel: ImportExcelLot) -> dict:
+    """
+    Crée / met à jour les exploitants à partir du classeur exploitants.
+    Les ménages doivent déjà exister (peupler_menages_depuis_excel avant).
+    """
+    lignes = list(StagingExploitantExcel.objects.filter(lot=lot_excel))
+
+    # Index ménages par code_men
+    menages = {
+        m.code_men: m
+        for m in Menage.objects.all()
+        if m.code_men
+    }
+
+    # Index niveaux d'instruction par libellé
+    niveaux = {
+        (n.lib_niv or "").strip().lower(): n
+        for n in NiveauInstruction.objects.all()
+        if n.lib_niv
+    }
+
+    crees, maj, ignores, sans_menage = 0, 0, 0, 0
+    vus = set()  # DISTINCT ON (code_expl)
+
+    with transaction.atomic():
+        for row in lignes:
+            data = row.donnees or {}
+
+            code_expl = (
+                row.code_exploitant
+                or _val(data, "Code exploitant", "code_exploitant", "code_expl")
+            )
+            if not code_expl or code_expl in vus:
+                ignores += 1
+                continue
+            vus.add(code_expl)
+
+            # Ménage
+            code_men = (
+                row.code_menage
+                or _val(data, "Q.14 Numero du menage", "Code menage", "code_menage")
+            )
+            menage = menages.get(code_men) if code_men else None
+            if not menage:
+                sans_menage += 1
+                # On peut quand même créer l'exploitant sans ménage (LEFT JOIN)
+                # Si tu préfères ignorer, décommente la ligne suivante :
+                # continue
+
+            # Niveau d'instruction
+            lib_niv = _val(data, "Q.41 Niveau d'instruction", "Niveau d'instruction")
+            niveau = niveaux.get((lib_niv or "").lower()) if lib_niv else None
+
+            defaults = {
+                "nom_expl": _val(data, "Q.34 Nom"),
+                "pren_expl": _val(data, "Q.35 Prenom(s)", "Q.35 Prenom(s)"),
+                "date_nais": _parse_date(_val(data, "Q.36 Date de naissance")),
+                "pays_nais": _val(data, "Q.37 Pays de naissance"),
+                "lieu_nais": _val(data, "Q.38 Lieu de naissance"),
+                "situa_mat": _val(data, "Q.40 Situation matrimoniale"),
+                "profession": _val(data, "Q.42 Profession"),
+                "nationalite": _val(data, "Q.47 Nationalite"),
+                "contacts": _val(data, "Q.50 Contact principal"),
+                "id_men": menage,
+                "id_niv": niveau,
+                "nom_declare": _val(
+                    data, "Q.31 Nom de l'exploitant (declare par representant)"
+                ),
+                "pren_declare": _val(
+                    data, "Q.32 Prenom(s) de l'exploitant (declare par representant)"
+                ),
+                "cont_declare": _val(
+                    data,
+                    "Q.33 Contact principal de l'exploitant (declare par representant)",
+                ),
+                "sexe": _val(data, "Q.39 Sexe"),
+                "formation_agricole": _val(data, "Q.43 A suivi une formation agricole"),
+                "justificatif_identite": _val(data, "Q.45 Justificatif d'identite"),
+                "numero_justicatif": _val(data, "Q.46 Numero du justificatif"),
+                "nb_justificatif_identite": _val(
+                    data, "Q.49 Nb photo(s) du justificatif"
+                ),
+                "a_batiment_stockage": _val(data, "Q.65 A un batiment de stockage"),
+                "capacite_stockage": _val(data, "Q.66 Capacite de stockage (t)"),
+                "a_machine_agricole": _val(data, "Q.67 A des machines agricoles"),
+                "machine_agricole": _val(data, "Q.68 Machines agricoles"),
+                "equipement_sechage": _val(data, "Q.69 Equipements de sechage"),
+                "depense_sante": _val(data, "Q.75 Depenses de sante (FCFA)"),
+                "a_compte_bancaire": _val(data, "Q.78 A un compte bancaire"),
+                "raison_absence_compte_bancaire": _val(
+                    data, "Q.80 Raisons de l'absence de compte"
+                ),
+                "raison_absence_compte_mobile_money": _val(
+                    data, "Q.83 Raisons de l'absence de mobile money"
+                ),
+                "a_deja_utilise_compte_mobile_money": _val(
+                    data, "Q.84 A deja utilise le mobile money"
+                ),
+                "montant_mensuel_transaction": _val(
+                    data, "Q.86 Montant mensuel des transactions (FCFA)"
+                ),
+                "montant_max_transaction": _val(
+                    data, "Q.87 Montant max des transactions (FCFA)"
+                ),
+                "benificie_cmu": _val(data, "Q.87a Beneficie de la CMU"),
+                "numero_securite_social": _val(
+                    data, "Q.87b Numero de securite sociale"
+                ),
+                "appartient_a_organisation_producteur": _val(
+                    data, "Q.88 Appartient a une organisation de producteurs"
+                ),
+                "type_organisation": _val(data, "Q.89 Type d'organisation"),
+                "specialisation_organisation": _val(
+                    data, "Q.90 Specialisation de l'organisation"
+                ),
+                "participe_a_tontine": _val(data, "Q.91 Participe a une tontine"),
+                "type_tontine": _val(data, "Q.92 Type de tontine"),
+                "montant_tontine": _val(data, "Q.93 Montant de la tontine (FCFA)"),
+                "nb_brouette": _val(data, "Q.100 Petits outils — Brouette (total)"),
+                "nb_machette": _val(data, "Q.100 Petits outils — Machettes (total)"),
+                "nb_atomisateur": _val(
+                    data, "Q.100 Petits outils — Atomiseur (total)"
+                ),
+                "nb_bascule": _val(data, "Q.100 Petits outils — Bascule (total)"),
+                "nb_tronconneuse": _val(
+                    data, "Q.100 Petits outils — Tronconneuse (total)"
+                ),
+                "nb_atomobile": _val(data, "Q.101 Transport — Automobile (total)"),
+                "nb_motocyclette": _val(
+                    data, "Q.101 Transport — Motocyclette (total)"
+                ),
+                "nb_tricycle": _val(data, "Q.101 Transport — Tricycle (total)"),
+                "nb_animaux_trait": _val(
+                    data, "Q.101 Transport — Animaux de trait (total)"
+                ),
+                "nb_charette": _val(data, "Q.101 Transport — Charrette (total)"),
+                "nb_autre_materiel": _val(
+                    data, "Q.101 Transport — Autres materiels (total)"
+                ),
+                "exploitant_est_representant": _val(
+                    data, "Q.16 Etes-vous l'exploitant ?"
+                ),
+                "nom_representant": _val(data, "Q.18 Nom du representant"),
+                "prenom_representant": _val(data, "Q.19 Prenom(s) du representant"),
+                "contact_representant": _val(
+                    data, "Q.29 Contact principal du representant"
+                ),
+                "compte_mobile": _val(data, "Q.82 Comptes mobile money"),
+                "nb_bicyclette": _val(
+                    data, "Q.101 Transport — Bicyclette (total)"
+                ),
+            }
+
+            obj, created = Exploitant.objects.update_or_create(
+                code_expl=code_expl,
+                defaults=defaults,
+            )
+            if created:
+                crees += 1
+            else:
+                maj += 1
+    
+
+    return {
+        "crees": crees,
+        "mis_a_jour": maj,
+        "ignores": ignores,
+        "sans_menage": sans_menage,
+        "total_uniques": len(vus),
+    }
+
+
+def peupler_parcelles_depuis_matches(
+    lot_sig: ImportLot,
+    lot_excel: ImportExcelLot,
+    *,
+    autoriser_remplacement: bool = True,
+) -> dict:
+    """
+    Peuple parcelle_correcte uniquement pour les lignes matchées
+    entre le lot SIG et le lot Excel.
+    """
+    statuts_ok = ["matche"]
+    if autoriser_remplacement:
+        statuts_ok.append("a_remplacer")
+
+    matches = (
+        SynchronisationMatch.objects
+        .filter(
+            lot_sig=lot_sig,
+            lot_excel=lot_excel,
+            statut__in=statuts_ok,
+        )
+        .select_related(
+            "import_parcelle",
+            "staging_parcelle",
+            "staging_exploitant",
+        )
+    )
+
+    exploitants = {
+        e.code_expl: e
+        for e in Exploitant.objects.all()
+        if e.code_expl
+    }
+    modes = {
+        (m.lib_mode or "").strip().lower(): m
+        for m in ModeFaireValoir.objects.all()
+        if m.lib_mode
+    }
+    enqueteurs = {
+        (e.code_enqt or "").strip(): e
+        for e in Enqueteur.objects.all()
+        if e.code_enqt
+    }
+
+    crees, maj, ignores, sans_expl, erreurs_geom = 0, 0, 0, 0, 0
+
+    with transaction.atomic():
+        for m in matches:
+            p_sig = m.import_parcelle
+            p_ex = m.staging_parcelle
+            if not p_sig or not p_ex:
+                ignores += 1
+                continue
+
+            data = p_ex.donnees or {}
+            props_sig = p_sig.proprietes or {}
+
+            # --- code parcelle (SIG prioritaire) ---
+            code_parc = (
+                p_sig.code
+                or m.code_parcelle
+                or _val(props_sig, "code", "code_parc", "name")
+            )
+            if not code_parc:
+                ignores += 1
+                continue
+
+            # --- exploitant ---
+            code_expl = (
+                m.code_exploitant
+                or _val(data, "Q.119 Numero exploitant", "Code exploitant", "code_exploitant")
+            )
+            expl = exploitants.get(code_expl) if code_expl else None
+            if not expl:
+                sans_expl += 1
+                continue
+
+            # --- mode de faire-valoir ---
+            lib_mode = _val(data, "Q.125 Mode de faire-valoir", "Mode de faire-valoir")
+            mode = modes.get((lib_mode or "").lower()) if lib_mode else None
+
+            # --- enquêteur (code enquêteur côté exploitant Excel si dispo) ---
+            enqt_data = (m.staging_exploitant.donnees if m.staging_exploitant else {}) or {}
+            code_enqt = _val(
+                enqt_data,
+                "Q.3 Code de l'enqueteur",
+                "Code de l'enqueteur",
+                "code_enqt",
+            )
+            enqueteur = enqueteurs.get(code_enqt) if code_enqt else None
+
+            # --- géométrie SIG ---
+            geojson = p_sig.geojson
+            if not geojson:
+                erreurs_geom += 1
+                continue
+
+            # superficie tracée : Excel sinon SIG
+            sup_tracee = (
+                _val(data, "Superficie calculee depuis tracee (ha)", "superficie_calculee")
+                or (str(p_sig.superficie_ha) if p_sig.superficie_ha is not None else None)
+            )
+            if sup_tracee:
+                sup_tracee = str(sup_tracee).replace(".", ",")  # comme ton format historique
+
+            annee = _parse_int(_val(data, "Q.121 Annee de mise en place"))
+
+            defaults = {
+                "annee_mise_place": annee,
+                "superficie_tracee": sup_tracee,
+                "id_expl": expl,
+                "id_mode": mode,
+                "id_enqt": enqueteur,
+                "surface_utilise": _val(data, "Q.123 Superficie en production (ha)"),
+                "superficie_en_production": _val(data, "Q.123 Superficie en production (ha)"),
+                "superficie_non_en_production": _val(
+                    data, "Q.124 Superficie non en production (ha)"
+                ),
+                "nb_entretiens_par_campagne": _val(
+                    data, "Q.128 Nb entretiens par campagne"
+                ),
+                "provenance_materiel_vegetal": _val(
+                    data, "Q.129 Provenance du materiel vegetal"
+                ),
+                "certification": _val(data, "Q.130 Certification"),
+                "access_service_conseil": _val(
+                    data, "Q.131 Acces a des services conseil"
+                ),
+                "service_conseil_utilise": _val(
+                    data, "Q.132 Services conseil utilises"
+                ),
+                "rehabilitation_effectue": _val(
+                    data, "Q.133 Rehabilitation effectuee"
+                ),
+                "superficie_rehabilite": _val(
+                    data, "Q.134 Superficie rehabilitee (ha)"
+                ),
+                "utilisation_engrais": _val(data, "Q.135 Utilisation d'engrais"),
+                "traitement_phytosanitaire": _val(
+                    data, "Q.136 Traitements phytosanitaires"
+                ),
+                "prix_engrais": _val(data, "Q.137 Engrais (FCFA)"),
+                "prix_entretien_parcelle": _val(data, "Q.137 Entretien (FCFA)"),
+                "prix_persticide": _val(data, "Q.137 Pesticides (FCFA)"),
+                "prix_materiel_agricole": _val(
+                    data, "Q.137 Materiel agricole (FCFA)"
+                ),
+                "anarcade_culture_principal": _val(
+                    data, "Q.140 Anacarde est la culture principale"
+                ),
+                "culture_associe": _val(data, "Q.139 Cultures associees"),
+                "nb_frequence_contractuel": _val(
+                    data, "Q.141 Contractuelle — frequence"
+                ),
+                "effectif_contractuel": _val(
+                    data, "Q.141 Contractuelle — effectif"
+                ),
+                "effectif_permanent": _val(
+                    data, "Q.141 Permanente — effectif"
+                ),
+                "salaire_main_oeuvre_permanent": _val(
+                    data, "Q.142 Salaire main d'oeuvre permanente (FCFA)"
+                ),
+                "parcelle_zone_interdite": _val(
+                    data, "Parcelle dans une zone interdite"
+                ),
+                "uuid_parcelle": m.uuid or p_sig.uuid_parcelle,
+            }
+
+            # Géométrie via PostGIS (comme ton import_publier actuel)
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id_parc FROM parcelle_correcte
+                    WHERE code_parc = %s
+                    FOR UPDATE
+                    """,
+                    [code_parc],
+                )
+                row = cur.fetchone()
+
+                if row is None:
+                    cur.execute(
+                        """
+                        INSERT INTO parcelle_correcte (
+                            code_parc, annee_mise_place, geom_parc, superficie_tracee,
+                            id_expl, id_mode, id_enqt,
+                            surface_utilise, superficie_en_production, superficie_non_en_production,
+                            nb_entretiens_par_campagne, provenance_materiel_vegetal, certification,
+                            access_service_conseil, service_conseil_utilise,
+                            rehabilitation_effectue, superficie_rehabilite,
+                            utilisation_engrais, traitement_phytosanitaire,
+                            prix_engrais, prix_entretien_parcelle, prix_persticide, prix_materiel_agricole,
+                            anarcade_culture_principal, culture_associe,
+                            nb_frequence_contractuel, effectif_contractuel, effectif_permanent,
+                            salaire_main_oeuvre_permanent, parcelle_zone_interdite, uuid_parcelle
+                        ) VALUES (
+                            %s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s,
+                            %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s
+                        )
+                        RETURNING id_parc
+                        """,
+                        [
+                            code_parc,
+                            defaults["annee_mise_place"],
+                            geojson,
+                            defaults["superficie_tracee"],
+                            expl.id_expl,
+                            mode.id_mode if mode else None,
+                            enqueteur.id_enqt if enqueteur else None,
+                            defaults["surface_utilise"],
+                            defaults["superficie_en_production"],
+                            defaults["superficie_non_en_production"],
+                            defaults["nb_entretiens_par_campagne"],
+                            defaults["provenance_materiel_vegetal"],
+                            defaults["certification"],
+                            defaults["access_service_conseil"],
+                            defaults["service_conseil_utilise"],
+                            defaults["rehabilitation_effectue"],
+                            defaults["superficie_rehabilite"],
+                            defaults["utilisation_engrais"],
+                            defaults["traitement_phytosanitaire"],
+                            defaults["prix_engrais"],
+                            defaults["prix_entretien_parcelle"],
+                            defaults["prix_persticide"],
+                            defaults["prix_materiel_agricole"],
+                            defaults["anarcade_culture_principal"],
+                            defaults["culture_associe"],
+                            defaults["nb_frequence_contractuel"],
+                            defaults["effectif_contractuel"],
+                            defaults["effectif_permanent"],
+                            defaults["salaire_main_oeuvre_permanent"],
+                            defaults["parcelle_zone_interdite"],
+                            defaults["uuid_parcelle"],
+                        ],
+                    )
+                    id_parc = cur.fetchone()[0]
+                    crees += 1
+                else:
+                    id_parc = row[0]
+                    cur.execute(
+                        """
+                        UPDATE parcelle_correcte SET
+                            annee_mise_place = %s,
+                            geom_parc = ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326),
+                            superficie_tracee = %s,
+                            id_expl = %s,
+                            id_mode = %s,
+                            id_enqt = %s,
+                            surface_utilise = %s,
+                            superficie_en_production = %s,
+                            superficie_non_en_production = %s,
+                            nb_entretiens_par_campagne = %s,
+                            provenance_materiel_vegetal = %s,
+                            certification = %s,
+                            access_service_conseil = %s,
+                            service_conseil_utilise = %s,
+                            rehabilitation_effectue = %s,
+                            superficie_rehabilite = %s,
+                            utilisation_engrais = %s,
+                            traitement_phytosanitaire = %s,
+                            prix_engrais = %s,
+                            prix_entretien_parcelle = %s,
+                            prix_persticide = %s,
+                            prix_materiel_agricole = %s,
+                            anarcade_culture_principal = %s,
+                            culture_associe = %s,
+                            nb_frequence_contractuel = %s,
+                            effectif_contractuel = %s,
+                            effectif_permanent = %s,
+                            salaire_main_oeuvre_permanent = %s,
+                            parcelle_zone_interdite = %s,
+                            uuid_parcelle = %s
+                        WHERE id_parc = %s
+                        """,
+                        [
+                            defaults["annee_mise_place"],
+                            geojson,
+                            defaults["superficie_tracee"],
+                            expl.id_expl,
+                            mode.id_mode if mode else None,
+                            enqueteur.id_enqt if enqueteur else None,
+                            defaults["surface_utilise"],
+                            defaults["superficie_en_production"],
+                            defaults["superficie_non_en_production"],
+                            defaults["nb_entretiens_par_campagne"],
+                            defaults["provenance_materiel_vegetal"],
+                            defaults["certification"],
+                            defaults["access_service_conseil"],
+                            defaults["service_conseil_utilise"],
+                            defaults["rehabilitation_effectue"],
+                            defaults["superficie_rehabilite"],
+                            defaults["utilisation_engrais"],
+                            defaults["traitement_phytosanitaire"],
+                            defaults["prix_engrais"],
+                            defaults["prix_entretien_parcelle"],
+                            defaults["prix_persticide"],
+                            defaults["prix_materiel_agricole"],
+                            defaults["anarcade_culture_principal"],
+                            defaults["culture_associe"],
+                            defaults["nb_frequence_contractuel"],
+                            defaults["effectif_contractuel"],
+                            defaults["effectif_permanent"],
+                            defaults["salaire_main_oeuvre_permanent"],
+                            defaults["parcelle_zone_interdite"],
+                            defaults["uuid_parcelle"],
+                            id_parc,
+                        ],
+                    )
+                    maj += 1
+
+            # Retour d’info sur le match
+            m.id_parc_publie = id_parc
+            m.id_expl_publie = expl.id_expl
+            m.statut = "publie"
+            m.save(update_fields=["id_parc_publie", "id_expl_publie", "statut"])
+
+    return {
+        "crees": crees,
+        "mis_a_jour": maj,
+        "ignores": ignores,
+        "sans_exploitant": sans_expl,
+        "erreurs_geometrie": erreurs_geom,
+    }
+
+@api_view(["POST"])
+def synchroniser_publier(request):
+    """
+    Publie une synchronisation SIG + Excel dans les tables métier.
+    Ordre : ménages → exploitants → parcelles_correctes.
+    """
+    id_lot_sig = request.data.get("id_lot_sig")
+    id_lot_excel = request.data.get("id_lot_excel")
+
+    if not id_lot_sig or not id_lot_excel:
+        return Response(
+            {"detail": "id_lot_sig et id_lot_excel sont obligatoires."},
+            status=400,
+        )
+
+    try:
+        lot_sig = ImportLot.objects.get(pk=id_lot_sig)
+        lot_excel = ImportExcelLot.objects.get(pk=id_lot_excel)
+    except (ImportLot.DoesNotExist, ImportExcelLot.DoesNotExist):
+        return Response({"detail": "Lot SIG ou Excel introuvable."}, status=404)
+
+    if lot_excel.statut not in ("synchronise",):
+        return Response(
+            {"detail": "Le lot Excel doit être synchronisé avant publication."},
+            status=409,
+        )
+
+    if lot_excel.statut == "publie":
+        return Response(
+            {"detail": "Ce lot Excel a déjà été publié."},
+            status=409,
+        )
+
+    try:
+        with transaction.atomic():
+            # 1. Ménages
+            bilan_men = peupler_menages_depuis_excel(lot_excel)
+            journaliser(
+                request,
+                action="Enregistrement menages",
+                cible=f"Excel#{lot_excel.id}",
+                detail=(
+                    f"{bilan_men.get('crees', 0)} créés, "
+                    f"{bilan_men.get('mis_a_jour', 0)} mis à jour, "
+                    f"{bilan_men.get('sans_quartier', 0)} sans quartier"
+                ),
+            )
+
+            # 2. Exploitants
+            bilan_expl = peupler_exploitants_depuis_excel(lot_excel)
+            journaliser(
+                request,
+                action="Enregistrement exploitants",
+                cible=f"Excel#{lot_excel.id}",
+                detail=(
+                    f"{bilan_expl.get('crees', 0)} créés, "
+                    f"{bilan_expl.get('mis_a_jour', 0)} mis à jour, "
+                    f"{bilan_expl.get('sans_menage', 0)} sans ménage"
+                ),
+            )
+
+            # 3. Parcelles (matches uniquement)
+            bilan_parc = peupler_parcelles_depuis_matches(lot_sig, lot_excel)
+            journaliser(
+                request,
+                action="Enregistrement parcelles",
+                cible=f"SIG#{lot_sig.id}+Excel#{lot_excel.id}",
+                detail=(
+                    f"{bilan_parc.get('crees', 0)} créées, "
+                    f"{bilan_parc.get('mis_a_jour', 0)} mises à jour, "
+                    f"{bilan_parc.get('sans_exploitant', 0)} sans exploitant, "
+                    f"{bilan_parc.get('erreurs_geometrie', 0)} erreurs géométrie"
+                ),
+            )
+
+            # Statut final du lot Excel
+            lot_excel.statut = "publie"
+            lot_excel.publie_le = timezone.now()
+            lot_excel.save(update_fields=["statut", "publie_le"])
+
+        journaliser(
+            request,
+            action="publication apres synchronisation",
+            cible=f"SIG#{lot_sig.id}+Excel#{lot_excel.id}",
+            detail=(
+                f"Publication OK — "
+                f"ménages={bilan_men.get('crees', 0)}+{bilan_men.get('mis_a_jour', 0)}, "
+                f"exploitants={bilan_expl.get('crees', 0)}+{bilan_expl.get('mis_a_jour', 0)}, "
+                f"parcelles={bilan_parc.get('crees', 0)}+{bilan_parc.get('mis_a_jour', 0)}"
+            ),
+            )
+
+        return Response({
+            "ok": True,
+            "message": "Insertion réussie.",
+            "menages": bilan_men,
+            "exploitants": bilan_expl,
+            "parcelles": bilan_parc,
+            "lot_excel": {
+                "id": lot_excel.id,
+                "statut": lot_excel.statut,
+                "publie_le": lot_excel.publie_le.isoformat() if lot_excel.publie_le else None,
+            },
+        })
+
+    except Exception as e:
+        journaliser(
+            request,
+            action="publication_synchronisation_echec",
+            cible=f"SIG#{id_lot_sig}+Excel#{id_lot_excel}",
+           detail=str(e)[:500],
+        )
+        return Response(
+            {
+                "ok": False,
+                "detail": f"Échec de la publication : {str(e)[:300]}",
+               "erreur": str(e)[:500],
+            },
+            status=500,
+        )
