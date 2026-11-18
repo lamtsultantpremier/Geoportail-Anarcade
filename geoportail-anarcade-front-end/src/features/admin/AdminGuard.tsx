@@ -5,6 +5,7 @@ import { Loader2 } from 'lucide-react'
 import { useAuth } from '../admin/auth'
 import AdminLogin from './AdminLogin'
 import {firstAllowed} from './auth'
+
 export default function AdminGuard({ children }: { children: React.ReactNode }) {
   const { user, ready, load, logout, clear } = useAuth()
 

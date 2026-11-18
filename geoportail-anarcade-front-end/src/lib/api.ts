@@ -38,12 +38,22 @@ export async function apiGet<T>(path: string, params: Params = {}, signal?: Abor
 }
 
 export async function apiSend<T>(
-  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown,
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  path: string,
+  body?: unknown,
 ): Promise<T> {
+  const isFormData = body instanceof FormData
+
   const res = await fetch(`${BASE}${path}`, {
-    method, headers: headers(body !== undefined),
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    method,
+    headers: isFormData ? headers(false) : headers(body !== undefined), // pas de Content-Type si FormData
+    body: isFormData
+      ? body
+      : body !== undefined
+        ? JSON.stringify(body)
+        : undefined,
   })
+
   if (!res.ok) await fail(res)
   return (res.status === 204 ? undefined : await res.json()) as T
 }

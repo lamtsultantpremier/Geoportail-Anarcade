@@ -16,7 +16,8 @@ const COLOR: any = [
   'erreur', '#ef4444',
   'doublon', '#f97316',
   'conservee', '#9ca3af',
-  ['get', '_color'],
+  // ['get', '_color'],
+   '#2563eb'
 ]
 
 export default function ImportedMap() {
@@ -116,8 +117,8 @@ export default function ImportedMap() {
           <div className="mb-2 text-[10px] tracking-widest text-muted">LÉGENDE</div>
             {okFiles.map((f) => (
                 <div key={f.id} className="mb-1 flex items-center gap-2">
-                    <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: f.color }} />
-                    <span className="truncate">{f.name}</span>
+                    <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background:  '#2563eb' }} />
+                    <span className="truncate">Nouvelle parcelle</span>
                 </div>
           ))}
           <div className="flex items-center gap-2">
@@ -126,7 +127,7 @@ export default function ImportedMap() {
           </div>
           <div className="flex items-center gap-2">
                 <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: '#f97316' }} />
-                    Existe déjà (à confirmer)
+                    Existe déjà dans la Base
         </div>
         <div className="flex items-center gap-2">
             <span className="size-3 shrink-0 rounded-sm border border-black/20" style={{ background: '#9ca3af' }} />
