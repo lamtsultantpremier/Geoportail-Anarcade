@@ -30,6 +30,7 @@ const nf = new Intl.NumberFormat('fr-FR')
 
 const BADGE: Record<ImportedFile['statut'], { label: string; cls: string }> = {
   brouillon: { label: 'Brouillon', cls: 'bg-amber-100 text-amber-800' },
+  synchronise: { label: 'Synchronisé', cls: 'bg-blue-100 text-blue-800' },
   publie: { label: 'Publié', cls: 'bg-brand-100 text-brand-700' },
   annule: { label: 'Annulé', cls: 'bg-line text-muted' },
 }
@@ -105,24 +106,33 @@ const isExcelSynced =
   (lastExcelLot!.statut === 'synchronise' || lastExcelLot!.statut === 'publie') &&
   (lastExcelLot!.nb_matches ?? 0) > 0
 
-  // On peut publier uniquement si les deux lots sont là ET qu’il y a eu un matching
-const canPublishSync = Boolean(lastSigLot && lastExcelLot && isExcelSynced)
+  const isAlreadyPublished =
+  lastExcelLot?.statut === 'publie' || lastSigLot?.statut === 'publie'
+
+  // On peut publier uniquement si les deux lots sont là ET qu’il y a eu un matching et doit disparaître apres
+const canPublishSync = Boolean(lastSigLot && lastExcelLot && isExcelSynced && !isAlreadyPublished)
 
 // Bouton Synchroniser visible seulement s’il reste quelque chose à synchroniser
-const canSynchronize = Boolean(lastSigLot && lastExcelLot && !isExcelSynced)
+const canSynchronize = Boolean(lastSigLot && lastExcelLot && lastExcelLot.statut === 'brouillon' &&
+                                            lastSigLot.statut !== 'publie')
 
 const [showPublishConfirm, setShowPublishConfirm] = useState(false)
 const [isPublishing, setIsPublishing] = useState(false)
 const [publishProgress, setPublishProgress] = useState(0)
 const [publishEtape, setPublishEtape] = useState('')
+
 const [publishResult, setPublishResult] = useState<{
   success: boolean
   message: string
   detail?: string
   bilans?: {
     menages?: { crees?: number; mis_a_jour?: number }
+    denombrements:{ crees?: number; mis_a_jour?: number }
+    pieces_justificatifs:{ crees?: number; mis_a_jour?: number }
     exploitants?: { crees?: number; mis_a_jour?: number }
     parcelles?: { crees?: number; mis_a_jour?: number }
+    parcelles_info: { crees?: number; mis_a_jour?: number }
+    enquetes:{ crees?: number; mis_a_jour?: number }
   }
 } | null>(null)
 
@@ -234,7 +244,7 @@ const launchSynchronization = async () => {
     // on mémorise s’il y a des matches
     setSyncDone(data.rows.length > 0)
     // Rafraîchir les lots Excel pour mettre à jour le statut
-   await refreshExcel()
+   await Promise.all([refresh(), refreshExcel()])
   } catch (e) {
     window.alert(e instanceof Error ? e.message : 'Échec de la synchronisation.')
   } finally {
@@ -250,12 +260,16 @@ const launchPublication = async () => {
   setPublishProgress(0)
   setPublishEtape('Préparation…')
 
-  const steps = [
-    { p: 20, label: 'Insertion des ménages…' },
-    { p: 45, label: 'Insertion des exploitants…' },
-    { p: 75, label: 'Insertion des parcelles…' },
-    { p: 90, label: 'Finalisation…' },
-  ]
+const steps = [
+  { p: 12, label: 'Ménages…' },
+  { p: 24, label: 'Dénombrements…' },
+  { p: 40, label: 'Exploitants…' },
+  { p: 52, label: 'Pièces justificatives…' },
+  { p: 70, label: 'Parcelles…' },
+  { p: 82, label: 'Infos parcelles…' },
+  { p: 92, label: 'Enquêtes…' },
+  { p: 100, label: 'Terminé' },
+]
 
   try {
     let stepIndex = 0
@@ -271,8 +285,12 @@ const launchPublication = async () => {
       ok: boolean
       message: string
       menages: { crees?: number; mis_a_jour?: number }
+      denombrements:{ crees?: number; mis_a_jour?: number }
+      pieces_justificatifs:{ crees?: number; mis_a_jour?: number }
       exploitants: { crees?: number; mis_a_jour?: number }
       parcelles: { crees?: number; mis_a_jour?: number }
+      parcelles_info: { crees?: number; mis_a_jour?: number }
+      enquetes:{ crees?: number; mis_a_jour?: number }
       detail?: string
       erreur?: string
     }>('POST', '/synchroniser/publier/', {
@@ -291,10 +309,15 @@ const launchPublication = async () => {
         menages: data.menages,
         exploitants: data.exploitants,
         parcelles: data.parcelles,
+        denombrements:data.denombrements,
+        pieces_justificatifs:data.pieces_justificatifs,
+        parcelles_info:data.parcelles_info,
+        enquetes:data.enquetes
       },
     })
 
-    await refreshExcel()
+    await Promise.all([refresh(), refreshExcel()])
+    refreshPlatform()
     // optionnel : refreshPlatform()
   } catch (e) {
     setPublishResult({
@@ -462,40 +485,23 @@ const openMatchDetail = async () => {
 
         {/* Actions SIG */}
         <div className="mt-3 flex flex-wrap gap-2">
-          {/* A placer plus tard */}
-          {/* {canPublish && lastSigLot.statut === 'brouillon' && (
-            <button
-              onClick={() => onPublish(lastSigLot)}
-              disabled={busyLot === lastSigLot.lotId}
-              className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
+          {lastSigLot.statut === 'publie' ? (
+            <span className="rounded-full bg-brand-100 px-3 py-1 text-[12px] font-semibold text-brand-700">
+              Publié
+            </span>
+        ) : (
+        canImport && (
+        <button
+            onClick={() => askDeleteSig(lastSigLot)}
+            disabled={busyLot === lastSigLot.lotId}
+            className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
             >
-              {busyLot === lastSigLot.lotId && <Loader2 size={13} className="animate-spin" />}
-              Publier
-            </button>
-          )} */}
-
-          {canPublish && lastSigLot.statut === 'publie' && (
-            <button
-              onClick={() => onCancel(lastSigLot)}
-              disabled={busyLot === lastSigLot.lotId}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold hover:bg-canvas disabled:opacity-60"
-            >
-              {busyLot === lastSigLot.lotId ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />}
-              Annuler
-            </button>
-          )}
-
-          {canImport && (
-            <button
-              onClick={() => askDeleteSig(lastSigLot)}
-              disabled={busyLot === lastSigLot.lotId}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
-            >
-              <Trash2 size={13} />
-              Supprimer
-            </button>
-          )}
-        </div>
+        <Trash2 size={13} />
+        Supprimer
+      </button>
+    )
+  )}
+</div>
       </li>
     )}
 
@@ -538,65 +544,48 @@ const openMatchDetail = async () => {
             </div>
           </div>
         </div>
-
-        {/* Action Excel (suppression indépendante) */}
-        {/* <div className="mt-3 flex flex-wrap gap-2"> */}
-          {/* {canImport && (
-            <button
-                onClick={(e) => {
-                    e.stopPropagation()
-                    askDeleteExcel(lastExcelLot)
-                }}
-
-              disabled={busyExcelLot === lastExcelLot.id}
-              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
-            >
-              {busyExcelLot === lastExcelLot.id ? (
-                <Loader2 size={13} className="animate-spin" />
-              ) : (
-                <Trash2 size={13} />
-              )}
-              Supprimer
-            </button>
-          )} */}
-        {/* </div> */}
         {/* Actions Excel */}
         <div className="mt-3 flex flex-wrap gap-2">
-            {/* Voir détail – uniquement après synchronisation réussie */}
+            {lastExcelLot.statut === 'publie' ? (
+              <span className="rounded-full bg-brand-100 px-3 py-1 text-[12px] font-semibold text-brand-700">
+                  Publié
+            </span>
+        ) : (
+        <>
             {isExcelSynced && (
-              <button
-                  onClick={(e) => {
-                  e.stopPropagation()
-                  openMatchDetail()
-            }}
+                <button
+                    onClick={(e) => {
+                    e.stopPropagation()
+                    openMatchDetail()
+                    }}
                   disabled={loadingMatches}
                   className="flex items-center gap-1.5 rounded-lg border border-line bg-slate-100 px-3 py-1.5 text-[12px] font-semibold text-slate-700 hover:bg-slate-200 disabled:opacity-60"
-        >
-      {loadingMatches ? (
-        <Loader2 size={13} className="animate-spin" />
-      ) : null}
-      Voir détail
-    </button>
-  )}
+               >
+                {loadingMatches && <Loader2 size={13} className="animate-spin" />}
+                Voir détail
+              </button>
+      )}
 
-  {canImport && (
-    <button
-      onClick={(e) => {
-        e.stopPropagation()
-        askDeleteExcel(lastExcelLot)
-      }}
-      disabled={busyExcelLot === lastExcelLot.id}
-      className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
-    >
-    {busyExcelLot === lastExcelLot.id ? (
-                <Loader2 size={13} className="animate-spin" />
-              ) : (
-                <Trash2 size={13} />
-              )}
-      Supprimer
-    </button>
+      {canImport && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            askDeleteExcel(lastExcelLot)
+          }}
+          disabled={busyExcelLot === lastExcelLot.id}
+          className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
+        >
+          {busyExcelLot === lastExcelLot.id ? (
+            <Loader2 size={13} className="animate-spin" />
+          ) : (
+            <Trash2 size={13} />
+          )}
+          Supprimer
+        </button>
+      )}
+    </>
   )}
-</div>
+  </div>
       </li>
     )}
 

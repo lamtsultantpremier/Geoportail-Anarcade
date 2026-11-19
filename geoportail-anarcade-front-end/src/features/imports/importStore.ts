@@ -4,7 +4,7 @@ import type { PolyFeature } from './parseGeoFile'
 
 const PALETTE = ['#f59e0b', '#06b6d4', '#ec4899', '#8b5cf6', '#3b82f6', '#14b8a6', '#f97316', '#6366f1']
 
-export type LotStatus = 'brouillon' | 'publie' | 'annule'
+export type LotStatus = 'brouillon' | 'publie' | 'annule'|'synchronise'
 
 interface LotSummary {
   id: number; fichier: string; format: string; statut: LotStatus
