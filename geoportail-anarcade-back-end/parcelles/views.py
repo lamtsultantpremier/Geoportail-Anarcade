@@ -4467,6 +4467,7 @@ def synchroniser(request):
                 messages=messages,
             )
             matches_crees.append(match)
+            nb_matches = len([m for m in matches_crees if m.statut == "matche"])
 
             # Ligne pour le tableau de prévisualisation
             rows_preview.append({
@@ -4482,8 +4483,16 @@ def synchroniser(request):
         # Mise à jour du lot Excel
         lot_excel.statut = "synchronise"
         lot_excel.synchronise_le = timezone.now()
-        lot_excel.nb_matches = len([m for m in matches_crees if m.statut == "matche"])
+        lot_excel.nb_matches = nb_matches
         lot_excel.save()
+
+        #Mise à Jour du lot SIG
+        lot_sig.statut = "synchronise"
+        lot_sig.nb_valides = nb_matches          # validés = nombre de matches
+        lot_sig.nb_avertissements = 0
+
+        #Erreur ou doublons
+        lot_sig.save(update_fields=["statut", "nb_valides", "nb_avertissements"])
 
         # Journalisation
         journaliser(
@@ -5195,6 +5204,270 @@ def peupler_parcelles_depuis_matches(
         "erreurs_geometrie": erreurs_geom,
     }
 
+def peupler_denombrements_depuis_excel(lot_excel: ImportExcelLot) -> dict:
+    """
+    Équivalent du INSERT denombrement (DISTINCT ON UUID).
+    """
+    lignes = list(StagingDenombrementExcel.objects.filter(lot=lot_excel))
+
+    menages = {m.code_men: m for m in Menage.objects.all() if m.code_men}
+    quartiers = {
+        (q.lib_quar or "").strip().lower(): q
+        for q in Quartier.objects.all() if q.lib_quar
+    }
+    milieux = {
+        (m.lib_mil or "").strip().lower(): m
+        for m in MilieuResidence.objects.all() if m.lib_mil
+    }
+
+    crees, maj, ignores = 0, 0, 0
+    vus = set()
+
+    with transaction.atomic():
+        for row in lignes:
+            data = row.donnees or {}
+            uuid = row.uuid or _val(data, "UUID", "uuid")
+            if not uuid or uuid in vus:
+                ignores += 1
+                continue
+            vus.add(uuid)
+
+            code_men = (
+                row.code_menage
+                or _val(data, "Q.15 Numero du menage", "Code menage", "code_menage")
+            )
+            menage = menages.get(code_men) if code_men else None
+
+            lib_quar = _val(data, "Q.13 Quartier/Campement", "Quartier/Campement")
+            quartier = quartiers.get((lib_quar or "").lower()) if lib_quar else None
+
+            lib_mil = _val(data, "Q.14 Milieu de residence", "Milieu de residence")
+            milieu = milieux.get((lib_mil or "").lower()) if lib_mil else None
+
+            defaults = {
+                "num_questionnaire": _val(
+                    data, "Q.2 Numero du questionnaire", "Numero du questionnaire"
+                ) or row.num_questionnaire,
+                "id_men": menage,
+                "id_quar": quartier,
+                "id_milieu_residence": milieu,
+                "coordonnee_gps": _val(data, "Q.4 Coordonnees GPS"),
+                "nom_chef_menage": _val(data, "Q.17 Nom du chef de menage"),
+                "prenom_chef_menage": _val(data, "Q.18 Prenom du chef de menage"),
+                "contact_chef_menage": _val(data, "Q.19 Contact du chef de menage"),
+                "a_exploitant": _val(
+                    data,
+                    "Q.16 Y a-t-il des exploitants d'anacarde dans le menage ?",
+                    "Q.22 Y a-t-il un representant de l'exploitant ?",
+                ),
+                "nb_exploitant": _val(data, "Q.20 Nombre d'exploitants d'anacarde"),
+                "date_enqt": _val(data, "Q.1 Date de l'enquete"),
+                "nom_prenom_enqt": _val(data, "Q.3 Nom et Prenom(s) de l'Enqueteur"),
+                "contact_enqt": _val(data, "Q.5 Contact de l'enqueteur"),
+                "statut": _val(data, "Statut"),
+                "source": _val(data, "Source"),
+                "date_creation": _val(data, "Cree le"),
+                "secteur_administratif": _val(data, "Q.10 Secteur administratif"),
+                "code_men": code_men or (menage.code_men if menage else None),
+            }
+
+            _, created = Denombrement.objects.update_or_create(
+                uuid=uuid,
+                defaults=defaults,
+            )
+            if created:
+                crees += 1
+            else:
+                maj += 1
+
+    return {"crees": crees, "mis_a_jour": maj, "ignores": ignores}
+
+def peupler_pieces_justificatives_depuis_excel(lot_excel: ImportExcelLot) -> dict:
+    """
+    DISTINCT ON (Code exploitant) → piece_justificatif.
+    """
+    lignes = list(StagingExploitantExcel.objects.filter(lot=lot_excel))
+    exploitants = {e.code_expl: e for e in Exploitant.objects.all() if e.code_expl}
+
+    crees, maj, ignores = 0, 0, 0
+    vus = set()
+
+    with transaction.atomic():
+        for row in lignes:
+            data = row.donnees or {}
+            code_expl = (
+                row.code_exploitant
+                or _val(data, "Code exploitant", "code_exploitant")
+            )
+            if not code_expl or code_expl in vus:
+                ignores += 1
+                continue
+            vus.add(code_expl)
+
+            expl = exploitants.get(code_expl)
+            if not expl:
+                ignores += 1
+                continue
+
+            type_piece = _val(data, "Q.45 Justificatif d'identite")
+            numero_piece = _val(data, "Q.46 Numero du justificatif")
+            if not type_piece and not numero_piece:
+                ignores += 1
+                continue
+
+            obj, created = PieceJustificatif.objects.update_or_create(
+                id_expl=expl,
+                code_expl=code_expl,
+                defaults={
+                    "type_piece": type_piece,
+                    "numero_piece": numero_piece,
+                },
+            )
+            # Si pas de contrainte unique (id_expl, code_expl), utilise plutôt create simple
+            if created:
+                crees += 1
+            else:
+                maj += 1
+
+    return {"crees": crees, "mis_a_jour": maj, "ignores": ignores}
+
+def peupler_parcelles_info_depuis_correctes(lot_sig, lot_excel) -> dict:
+    """
+    Recopie dans parcelle_info les parcelles_correcte issues des matches publiés.
+    """
+    ids_parc = list(
+        SynchronisationMatch.objects.filter(
+            lot_sig=lot_sig,
+            lot_excel=lot_excel,
+            statut="publie",
+            id_parc_publie__isnull=False,
+        ).values_list("id_parc_publie", flat=True)
+    )
+
+    crees, maj = 0, 0
+    with transaction.atomic():
+        for pc in ParcelleCorrecte.objects.filter(id_parc__in=ids_parc):
+            defaults = {
+                "annee_mise_place": pc.annee_mise_place,
+                "superficie_tracee": pc.superficie_tracee,
+                "id_expl": pc.id_expl,
+                "id_mode": pc.id_mode,
+                "id_enqt": pc.id_enqt,
+                "surface_utilise": pc.surface_utilise,
+                "superficie_mise_en_jachere": getattr(pc, "surface_mis_en_jachere", None),
+                "superficie_en_production": pc.superficie_en_production,
+                "superficie_non_en_production": pc.superficie_non_en_production,
+                "nb_entretiens_par_campagne": pc.nb_entretiens_par_campagne,
+                "provenance_materiel_vegetal": pc.provenance_materiel_vegetal,
+                "certification": pc.certification,
+                "access_service_conseil": pc.access_service_conseil,
+                "service_conseil_utilise": pc.service_conseil_utilise,
+                "rehabilitation_effectue": pc.rehabilitation_effectue,
+                "superficie_rehabilite": pc.superficie_rehabilite,
+                "utilisation_engrais": pc.utilisation_engrais,
+                "traitement_phytosanitaire": pc.traitement_phytosanitaire,
+                "prix_engrais": pc.prix_engrais,
+                "prix_entretien_parcelle": pc.prix_entretien_parcelle,
+                "prix_persticide": pc.prix_persticide,
+                "prix_materiel_agricole": pc.prix_materiel_agricole,
+                "anarcade_culture_principal": pc.anarcade_culture_principal,
+                "culture_associe": pc.culture_associe,
+                "nb_frequence_contractuel": pc.nb_frequence_contractuel,
+                "effectif_contractuel": pc.effectif_contractuel,
+                "effectif_permanent": pc.effectif_permanent,
+                "salaire_main_oeuvre_permanent": pc.salaire_main_oeuvre_permanent,
+                "parcelle_zone_interdite": pc.parcelle_zone_interdite,
+                "frequence_permanent": getattr(pc, "uuid_parcelle", None),
+            }
+            _, created = ParcelleInfo.objects.update_or_create(
+                code_parcel=pc.code_parc,
+                defaults=defaults,
+            )
+            if created:
+                crees += 1
+            else:
+                maj += 1
+
+    return {"crees": crees, "mis_a_jour": maj}
+
+def peupler_enquetes_depuis_excel(lot_excel: ImportExcelLot) -> dict:
+    """
+    Crée les enquêtes à partir dénombrement + exploitant + enquêteur.
+    """
+    staging_expl = list(StagingExploitantExcel.objects.filter(lot=lot_excel))
+
+    denombrements = {
+        (d.num_questionnaire or "").strip(): d
+        for d in Denombrement.objects.exclude(num_questionnaire__isnull=True)
+        if d.num_questionnaire
+    }
+    exploitants = {e.code_expl: e for e in Exploitant.objects.all() if e.code_expl}
+    enqueteurs = {
+        (e.code_enqt or "").strip(): e
+        for e in Enqueteur.objects.all() if e.code_enqt
+    }
+
+    crees, ignores = 0, 0
+    vus = set()
+
+    with transaction.atomic():
+        for row in staging_expl:
+            data = row.donnees or {}
+            code_expl = (
+                row.code_exploitant
+                or _val(data, "Code exploitant", "Q.15 Numero exploitant")
+            )
+            code_enqt = _val(data, "Q.3 Code de l'enqueteur", "code_enqt")
+            if not code_expl or not code_enqt:
+                ignores += 1
+                continue
+
+            expl = exploitants.get(code_expl)
+            enqt = enqueteurs.get(code_enqt.strip())
+            if not expl or not enqt:
+                ignores += 1
+                continue
+
+            # Questionnaire via ménage / dénombrement si possible
+            code_men = (
+                row.code_menage
+                or _val(data, "Q.14 Numero du menage", "Code menage")
+            )
+            num_quest = None
+            date_enq = None
+            if code_men:
+                den = (
+                    Denombrement.objects
+                    .filter(code_men=code_men)
+                    .order_by("-id_denomb")
+                    .first()
+                )
+                if den:
+                    num_quest = den.num_questionnaire
+                    date_enq = _parse_date(den.date_enqt)
+
+            key = (expl.id_expl, enqt.id_enqt, num_quest or "")
+            if key in vus:
+                ignores += 1
+                continue
+            vus.add(key)
+
+            # Évite les doublons num_questionnaire unique
+            if num_quest and Enquete.objects.filter(num_questionnaire=num_quest).exists():
+                ignores += 1
+                continue
+
+            Enquete.objects.create(
+                date_enq=date_enq,
+                id_enqt=enqt,
+                id_expl=expl,
+                num_questionnaire=num_quest,
+            )
+            crees += 1
+
+    return {"crees": crees, "ignores": ignores}
+
+
 @api_view(["POST"])
 def synchroniser_publier(request):
     """
@@ -5242,8 +5515,12 @@ def synchroniser_publier(request):
                     f"{bilan_men.get('sans_quartier', 0)} sans quartier"
                 ),
             )
+            #2- Denombrement
+            bilan_den = peupler_denombrements_depuis_excel(lot_excel)
+            journaliser(request, "Enregistrement denombrements", f"Excel#{lot_excel.id}",
+                    f"{bilan_den}")
 
-            # 2. Exploitants
+            # 3. Exploitants
             bilan_expl = peupler_exploitants_depuis_excel(lot_excel)
             journaliser(
                 request,
@@ -5256,7 +5533,12 @@ def synchroniser_publier(request):
                 ),
             )
 
-            # 3. Parcelles (matches uniquement)
+            #4. Pieces Justificatif
+            bilan_pieces = peupler_pieces_justificatives_depuis_excel(lot_excel)
+            journaliser(request, "Enregistrement pieces justificatives", f"Excel#{lot_excel.id}",
+                    f"{bilan_pieces}")
+
+            # 5. Parcelles (matches uniquement)
             bilan_parc = peupler_parcelles_depuis_matches(lot_sig, lot_excel)
             journaliser(
                 request,
@@ -5270,29 +5552,56 @@ def synchroniser_publier(request):
                 ),
             )
 
+            #6. Parcelle infos
+            bilan_info = peupler_parcelles_info_depuis_correctes(lot_sig, lot_excel)
+            journaliser(request, "Enregistrement parcelle_info", f"Excel#{lot_excel.id}",
+                    f"{bilan_info}")
+
+            #7. Enquetes
+            bilan_enq = peupler_enquetes_depuis_excel(lot_excel)
+            journaliser(request, "Enregistrement enquetes", f"Excel#{lot_excel.id}",
+                    f"{bilan_enq}")
+
+            
             # Statut final du lot Excel
             lot_excel.statut = "publie"
             lot_excel.publie_le = timezone.now()
             lot_excel.save(update_fields=["statut", "publie_le"])
 
         journaliser(
-            request,
-            action="publication apres synchronisation",
-            cible=f"SIG#{lot_sig.id}+Excel#{lot_excel.id}",
-            detail=(
-                f"Publication OK — "
-                f"ménages={bilan_men.get('crees', 0)}+{bilan_men.get('mis_a_jour', 0)}, "
-                f"exploitants={bilan_expl.get('crees', 0)}+{bilan_expl.get('mis_a_jour', 0)}, "
-                f"parcelles={bilan_parc.get('crees', 0)}+{bilan_parc.get('mis_a_jour', 0)}"
-            ),
+                request,
+                "publication apres synchronisation",
+                f"SIG#{lot_sig.id}+Excel#{lot_excel.id}",
+                (
+                    f"men={bilan_men}, den={bilan_den}, expl={bilan_expl}, "
+                    f"pieces={bilan_pieces}, parc={bilan_parc}, info={bilan_info}, enq={bilan_enq}"
+                ),
             )
 
+        #Mise à jour du lot Excel
+        lot_excel.statut = "publie"
+        lot_excel.publie_le = timezone.now()
+        lot_excel.save(update_fields=["statut", "publie_le"])
+
+        #Mise à jour du lot SIG
+        lot_sig.statut = "publie"
+        lot_sig.publie_le = timezone.now()
+        lot_sig.save(update_fields=["statut", "publie_le"])
         return Response({
             "ok": True,
             "message": "Insertion réussie.",
             "menages": bilan_men,
             "exploitants": bilan_expl,
+            "denombrements":bilan_den,
+            "pieces_justificatifs":bilan_pieces,
             "parcelles": bilan_parc,
+            "parcelles_info":bilan_info,
+            "enquetes":bilan_enq,
+            "lot_sig":{
+                "id":lot_sig.id,
+                "status":lot_sig.statut,
+                "publie_le":lot_sig.publie_le.isoformat() if lot_sig.publie_le else None
+            },
             "lot_excel": {
                 "id": lot_excel.id,
                 "statut": lot_excel.statut,

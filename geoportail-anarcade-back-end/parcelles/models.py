@@ -535,9 +535,16 @@ class ZoneDenombrement(models.Model):
         db_table = 'zone_denombrement'
 
 class ImportLot(models.Model):
+  
+    STATUT_CHOICES = [
+            ("brouillon", "Brouillon"),
+            ("synchronise", "Synchronisé"),
+            ("publie", "Publié"),
+            ("annule", "Annulé"),
+        ]
     nom_fichier = models.CharField(max_length=255)
     format = models.CharField(max_length=20)
-    statut = models.CharField(max_length=10, default="brouillon")  # brouillon | publie | annule
+    statut = models.CharField(max_length=25,choices=STATUT_CHOICES, default="brouillon")  # brouillon | publie | annule|synchronise
     cree_le = models.DateTimeField(auto_now_add=True)
     publie_le = models.DateTimeField(null=True, blank=True)
     nb_total = models.IntegerField(default=0)
